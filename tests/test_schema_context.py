@@ -107,10 +107,14 @@ def test_introspect_columns(analytics_db):
 def test_load_schema_context_default(analytics_db, schema_description_db, monkeypatch):
     monkeypatch.delenv("SCHEMA_INCLUDE_DESCRIPTION", raising=False)
     result = load_schema_context(analytics_db, schema_description_db)
-    assert set(result.keys()) == {"ddl"}
+    assert {"ddl", "tables", "columns", "column_types"} <= set(result.keys())
     assert result["ddl"].strip().startswith(f"CREATE TABLE {TABLE_NAME}")
     # default is include_description=True
     assert "-- Age of the participant" in result["ddl"]
+    # schema validation keys are populated
+    assert TABLE_NAME in result["tables"]
+    assert TABLE_NAME in result["columns"]
+    assert TABLE_NAME in result["column_types"]
 
 
 @pytest.mark.parametrize("env_value,expected_in_ddl", [

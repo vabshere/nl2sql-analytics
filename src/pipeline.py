@@ -1,16 +1,22 @@
 from __future__ import annotations
-from src.types import (
-    SQLValidationOutput,
-    SQLExecutionOutput,
-    PipelineOutput,
-)
-from src.schema_context import load_schema_context
-from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 
 import logging
 import sqlite3
 import time
 from pathlib import Path
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ErrorLevel
+from sqlglot.optimizer.simplify import simplify
+
+from src.llm_client import OpenRouterLLMClient, build_default_llm_client
+from src.schema_context import load_schema_context
+from src.types import (
+    PipelineOutput,
+    SQLExecutionOutput,
+    SQLValidationOutput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +32,63 @@ class SQLValidationError(Exception):
 
 class SQLValidator:
     @classmethod
-    def validate(cls, sql: str | None) -> SQLValidationOutput:
+    def validate(
+        cls,
+        sql: str | None,
+        schema_context: dict | None = None,
+    ) -> SQLValidationOutput:
         start = time.perf_counter()
 
-        if sql is None:
+        def _invalid(error: str) -> SQLValidationOutput:
             return SQLValidationOutput(
                 is_valid=False,
                 validated_sql=None,
-                error="No SQL provided",
+                error=error,
                 timing_ms=(time.perf_counter() - start) * 1000,
             )
 
-        # TODO: Implement SQL validation logic
-        # Consider what validation is needed for this use case
+        # Layer 0: None / empty guard
+        if not sql or not sql.strip():
+            return _invalid("No SQL provided")
+
+        # Layer 1: parse + statement-type check via sqlglot
+        # WHY: sqlglot raises ParseError on invalid syntax AND gives us a typed
+        # AST, letting us check statement type and structure in one pass without
+        # a separate DB round-trip
+        try:
+            parsed = sqlglot.parse(sql, dialect="sqlite", error_level=ErrorLevel.RAISE)
+        except sqlglot.errors.ParseError as exc:
+            return _invalid(f"SQL syntax error: {exc}")
+
+        if len(parsed) > 1:
+            return _invalid("Multi-statement SQL is not allowed.")
+
+        if not isinstance(parsed[0], exp.Select):
+            stmt_type = type(parsed[0]).__name__.upper()
+            return _invalid(f"SQL statement type '{stmt_type}' is not allowed; only SELECT queries are permitted.")
+
+        stmt = parsed[0]
+
+        # Layer 2: schema + semantic validation
+        if schema_context:
+            known_tables = {t.lower() for t in schema_context.get("tables", set())}
+            referenced_tables = {t.name.lower() for t in stmt.find_all(exp.Table)}
+
+            # 2a. Must reference at least one real table
+            if not referenced_tables:
+                return _invalid("Query must reference at least one table.")
+
+            # 2b. All referenced tables must exist in the schema
+            unknown = referenced_tables - known_tables
+            if unknown:
+                return _invalid(f"References unknown table(s): {sorted(unknown)}")
+
+            # 2c. Reject always-true WHERE clause (1=1, OR 1=1, WHERE TRUE, etc.)
+            # WHY: simplify() removes the WHERE entirely when the condition is a
+            # tautology; checking original-has-WHERE vs simplified-has-none
+            # catches non-obvious forms like 1+0=1 or 'x' LIKE 'x' too
+            if stmt.find(exp.Where) and not simplify(stmt).find(exp.Where):
+                return _invalid("WHERE clause is always true.")
 
         return SQLValidationOutput(
             is_valid=True,
@@ -121,7 +171,7 @@ class AnalyticsPipeline:
         sql = sql_gen_output.sql
 
         # Stage 2: SQL Validation
-        validation_output = SQLValidator.validate(sql)
+        validation_output = SQLValidator.validate(sql, schema_context=self._schema_context)
         if not validation_output.is_valid:
             sql = None
 

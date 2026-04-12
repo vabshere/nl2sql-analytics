@@ -178,4 +178,15 @@ def load_schema_context(
         include_description=include_description,
     )
 
-    return {"ddl": ddl}
+    # WHY: tables, columns, and column_types are included so SQLValidator can
+    # check referenced names against the known schema without a second DB
+    # round-trip at query time. column_types stores declared affinity for future
+    # type-aware checks without imposing any validation logic now.
+    column_names: set[str] = {name for name, _ in columns}
+    column_types: dict[str, str] = {name: col_type for name, col_type in columns}
+    return {
+        "ddl": ddl,
+        "tables": {TABLE_NAME},
+        "columns": {TABLE_NAME: column_names},
+        "column_types": {TABLE_NAME: column_types},
+    }
