@@ -5,9 +5,19 @@ import os
 import time
 from typing import Any
 
+from openrouter.components.chatformatjsonschemaconfig import (
+    ChatFormatJSONSchemaConfig,
+    ChatJSONSchemaConfig,
+)
+from pydantic import BaseModel
+
 from src.types import SQLGenerationOutput, AnswerGenerationOutput
 
 DEFAULT_MODEL = "openai/gpt-5-nano"
+
+
+class SQLResponse(BaseModel):
+    sql: str | None
 
 
 class OpenRouterLLMClient:
@@ -22,19 +32,43 @@ class OpenRouterLLMClient:
             raise RuntimeError("Missing dependency: install 'openrouter'.") from exc
         self.model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         self._client = OpenRouter(api_key=api_key)
-        self._stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._stats = {
+            "llm_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
-    def _chat(self, messages: list[dict[str, str]], temperature: float, max_tokens: int) -> str:
+    def _chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        response_format=None,
+    ) -> str:
+        kwargs = {}
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+
         res = self._client.chat.send(
             messages=messages,
             model=self.model,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=False,
+            **kwargs,
         )
 
-        # TODO: Implement token counting here
-        # Required for efficiency evaluation - see README.md for details.
+        # WHY: llm_calls is always incremented regardless of whether usage is
+        # present — some models/providers may return None usage on errors.
+        self._stats["llm_calls"] += 1
+        usage = getattr(res, "usage", None)
+        if usage is not None:
+            # WHY: SDK returns float token counts (e.g. 557.0); cast to int so
+            # stats are always integers rather than floats
+            self._stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            self._stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+            self._stats["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
 
         choices = getattr(res, "choices", None) or []
         if not choices:
@@ -46,20 +80,12 @@ class OpenRouterLLMClient:
 
     @staticmethod
     def _extract_sql(text: str) -> str | None:
-        maybe_json = text.strip()
-        if maybe_json.startswith("{") and maybe_json.endswith("}"):
-            try:
-                parsed = json.loads(maybe_json)
-                sql = parsed.get("sql")
-                if isinstance(sql, str) and sql.strip():
-                    return sql.strip()
-                return None
-            except json.JSONDecodeError:
-                pass
-        lower = text.lower()
-        idx = lower.find("select ")
-        if idx >= 0:
-            return text[idx:].strip()
+        # WHY: structured output guarantees valid JSON; non-JSON is an unexpected
+        # API failure that should surface as an error, not be silently swallowed
+        parsed = json.loads(text)
+        sql = parsed.get("sql") if isinstance(parsed, dict) else None
+        if isinstance(sql, str) and sql.strip():
+            return sql.strip()
         return None
 
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
@@ -76,9 +102,20 @@ class OpenRouterLLMClient:
 
         try:
             text = self._chat(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
                 temperature=0.0,
-                max_tokens=240,
+                max_tokens=10000,
+                response_format=ChatFormatJSONSchemaConfig(
+                    type="json_schema",
+                    json_schema=ChatJSONSchemaConfig(
+                        name="sql_output",
+                        schema_=SQLResponse.model_json_schema(),
+                        strict=True,
+                    ),
+                ),
             )
             sql = self._extract_sql(text)
         except Exception as exc:
@@ -100,21 +137,30 @@ class OpenRouterLLMClient:
             return AnswerGenerationOutput(
                 answer="I cannot answer this with the available table and schema. Please rephrase using known survey fields.",
                 timing_ms=0.0,
-                llm_stats={"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": self.model},
+                llm_stats={
+                    "llm_calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": self.model,
+                },
                 error=None,
             )
         if not rows:
             return AnswerGenerationOutput(
                 answer="Query executed, but no rows were returned.",
                 timing_ms=0.0,
-                llm_stats={"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": self.model},
+                llm_stats={
+                    "llm_calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": self.model,
+                },
                 error=None,
             )
 
-        system_prompt = (
-            "You are a concise analytics assistant. "
-            "Use only the provided SQL results. Do not invent data."
-        )
+        system_prompt = "You are a concise analytics assistant. Use only the provided SQL results. Do not invent data."
         user_prompt = (
             f"Question:\n{question}\n\nSQL:\n{sql}\n\n"
             f"Rows (JSON):\n{json.dumps(rows[:30], ensure_ascii=True)}\n\n"
@@ -127,7 +173,10 @@ class OpenRouterLLMClient:
 
         try:
             answer = self._chat(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
                 temperature=0.2,
                 max_tokens=220,
             )
@@ -148,7 +197,12 @@ class OpenRouterLLMClient:
 
     def pop_stats(self) -> dict[str, Any]:
         out = dict(self._stats or {})
-        self._stats = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._stats = {
+            "llm_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         return out
 
 

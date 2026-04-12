@@ -1,0 +1,48 @@
+{
+  "tables": {
+    "gaming_mental_health": {
+      "description": "Gaming and Mental Health Behavioral Dataset",
+      "columns": {
+        "age":                      { "description": "Age of the participant",              "domain": "Demographic" },
+        "gender":                   { "description": "Gender category",                     "domain": "Demographic" },
+        "income":                   { "description": "Monthly income estimate",             "domain": "Demographic" },
+        "daily_gaming_hours":       { "description": "Average daily gaming time",           "domain": "Gaming behavior" },
+        "weekly_sessions":          { "description": "Number of weekly gaming sessions",    "domain": "Gaming behavior" },
+        "years_gaming":             { "description": "Total years of gaming experience",    "domain": "Gaming behavior" },
+        "sleep_hours":              { "description": "Average sleep duration",              "domain": "Lifestyle" },
+        "caffeine_intake":          { "description": "Daily caffeine consumption",          "domain": "Lifestyle" },
+        "exercise_hours":           { "description": "Weekly exercise hours",               "domain": "Lifestyle" },
+        "stress_level":             { "description": "Perceived stress score",              "domain": "Psychological" },
+        "anxiety_score":            { "description": "Anxiety assessment score",            "domain": "Psychological" },
+        "depression_score":         { "description": "Depression score",                   "domain": "Psychological" },
+        "social_interaction_score": { "description": "Social activity index",               "domain": "Social" },
+        "relationship_satisfaction":{ "description": "Relationship quality score",         "domain": "Social" },
+        "academic_performance":     { "description": "Academic score",                     "domain": "Productivity" },
+        "work_productivity":        { "description": "Workplace productivity score",        "domain": "Productivity" },
+        "addiction_level":          { "description": "Gaming addiction indicator",          "domain": "Psychological" },
+        "multiplayer_ratio":        { "description": "Fraction of multiplayer gaming",      "domain": "Gaming behavior" },
+        "toxic_exposure":           { "description": "Exposure to toxic communities",       "domain": "Social" },
+        "violent_games_ratio":      { "description": "Fraction of violent games played",   "domain": "Gaming behavior" },
+        "mobile_gaming_ratio":      { "description": "Fraction of mobile gaming",          "domain": "Gaming behavior" },
+        "night_gaming_ratio":       { "description": "Proportion of night-time gaming",    "domain": "Gaming behavior" },
+        "weekend_gaming_hours":     { "description": "Weekend gaming duration",             "domain": "Gaming behavior" },
+        "friends_gaming_count":     { "description": "Number of gaming friends",           "domain": "Social" },
+        "online_friends":           { "description": "Online social connections",           "domain": "Social" },
+        "streaming_hours":          { "description": "Weekly game streaming hours",        "domain": "Gaming behavior" },
+        "esports_interest":         { "description": "Interest in esports participation",  "domain": "Gaming behavior" },
+        "headset_usage":            { "description": "Whether headset is used",            "domain": "Gaming behavior" },
+        "microtransactions_spending":{ "description": "Monthly in-game spending",          "domain": "Gaming behavior" },
+        "parental_supervision":     { "description": "Parental monitoring score",          "domain": "Social" },
+        "loneliness_score":         { "description": "Loneliness index",                   "domain": "Psychological" },
+        "aggression_score":         { "description": "Aggression tendency score",          "domain": "Psychological" },
+        "happiness_score":          { "description": "Overall happiness level",            "domain": "Psychological" },
+        "bmi":                      { "description": "Body mass index",                    "domain": "Physical" },
+        "screen_time_total":        { "description": "Total daily screen time",            "domain": "Lifestyle" },
+        "eye_strain_score":         { "description": "Eye strain severity",                "domain": "Physical" },
+        "back_pain_score":          { "description": "Back pain severity",                 "domain": "Physical" },
+        "competitive_rank":         { "description": "Competitive skill ranking",          "domain": "Gaming behavior" },
+        "internet_quality":         { "description": "Internet connectivity quality",      "domain": "Lifestyle" }
+      }
+    }
+  }
+}

@@ -1,19 +1,23 @@
 from __future__ import annotations
-
-import sqlite3
-import time
-from pathlib import Path
-
-from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 from src.types import (
     SQLValidationOutput,
     SQLExecutionOutput,
     PipelineOutput,
 )
+from src.schema_context import load_schema_context
+from src.llm_client import OpenRouterLLMClient, build_default_llm_client
+
+import logging
+import sqlite3
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = BASE_DIR / "data" / "gaming_mental_health.sqlite"
+DEFAULT_METADATA_DB_PATH = BASE_DIR / "data" / "schema_metadata.sqlite"
 
 
 class SQLValidationError(Exception):
@@ -83,16 +87,37 @@ class SQLiteExecutor:
 
 
 class AnalyticsPipeline:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, llm_client: OpenRouterLLMClient | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path = DEFAULT_DB_PATH,
+        llm_client: OpenRouterLLMClient | None = None,
+        metadata_db_path: str | Path = DEFAULT_METADATA_DB_PATH,
+    ) -> None:
         self.db_path = Path(db_path)
         self.llm = llm_client or build_default_llm_client()
         self.executor = SQLiteExecutor(self.db_path)
+        # WHY: build once at init — schema is static, no per-request DB roundtrip
+        try:
+            self._schema_context = load_schema_context(self.db_path, Path(metadata_db_path))
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "Could not introspect schema from %s (%s) — generate_sql will receive empty context.",
+                self.db_path,
+                exc,
+            )
+            self._schema_context = {}
+        except Exception as exc:
+            logger.error(
+                "Unexpected error building schema context: %s — generate_sql will receive empty context.",
+                exc,
+            )
+            self._schema_context = {}
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         start = time.perf_counter()
 
         # Stage 1: SQL Generation
-        sql_gen_output = self.llm.generate_sql(question, {})
+        sql_gen_output = self.llm.generate_sql(question, self._schema_context)
         sql = sql_gen_output.sql
 
         # Stage 2: SQL Validation
