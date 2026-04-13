@@ -60,8 +60,8 @@ class TestChatTimeout:
 
         client._client.chat.send = _fake_send
         client._chat(messages=[{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=100)
-        assert "timeout" in captured_kwargs
-        assert captured_kwargs["timeout"] == 30
+        assert "timeout_ms" in captured_kwargs
+        assert captured_kwargs["timeout_ms"] == 30_000  # LLM_TIMEOUT_SECONDS=30 → 30_000ms
 
     def test_default_timeout_is_60(self, monkeypatch):
         monkeypatch.delenv("LLM_TIMEOUT_SECONDS", raising=False)

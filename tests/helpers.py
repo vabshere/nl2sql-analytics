@@ -61,5 +61,10 @@ class BaseLLMStub:
     def judge_answer_grounding(self, question: str, sql: str, rows: list, answer: str) -> AnswerGroundingJudgeOutput:
         return AnswerGroundingJudgeOutput(verdict=True, grade="pass", issues=[], reason="")
 
+    def correct_sql(self, question: str, failed_sql: str, db_error: str, context: dict) -> SQLGenerationOutput:
+        # WHY: delegates to generate_sql so stubs that don't override this still
+        # return a valid SQLGenerationOutput without duplicating stub machinery
+        return self.generate_sql(question, context)
+
     def pop_stats(self) -> dict[str, Any]:
         return dict(_ZERO_STATS)

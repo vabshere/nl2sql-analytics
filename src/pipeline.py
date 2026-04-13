@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -15,7 +16,9 @@ from src.schema_context import _parse_bool_env, load_schema_context
 from src.types import (
     PipelineOutput,
     ResultValidationOutput,
+    SQLAnalyticsJudgeOutput,
     SQLExecutionOutput,
+    SQLGenerationOutput,
     SQLValidationOutput,
 )
 
@@ -232,6 +235,36 @@ class AnalyticsPipeline:
             )
             self._schema_context = {}
 
+    def _validate_and_execute(
+        self,
+        question: str,
+        candidate_sql: str | None,
+        sql_gen_output: SQLGenerationOutput,
+        stats_sink: list[dict],
+    ) -> tuple[SQLValidationOutput, str | None, SQLExecutionOutput, SQLAnalyticsJudgeOutput | None]:
+        """Validate a SQL candidate, optionally judge it analytically, and execute it.
+
+        WHY: the validate→judge→execute sequence is the same for both the initial
+        SQL and each corrected SQL — extracting it removes the duplication.
+
+        Appends judge llm_stats to stats_sink in-place (empty dict when disabled).
+        Returns (validation_output, validated_sql_or_None, execution_output, judge_verdict_or_None).
+        validated_sql_or_None is None when validation fails; caller breaks the
+        correction loop on None.
+        judge_verdict_or_None is None when judge is disabled or validation failed.
+        """
+        validation_output = SQLValidator.validate(candidate_sql, schema_context=self._schema_context)
+        if not validation_output.is_valid:
+            return validation_output, None, SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0), None
+        # WHY: judge is opt-in and non-blocking; stats appended to sink for aggregation
+        judge_verdict: SQLAnalyticsJudgeOutput | None = None
+        if _parse_bool_env("SQL_ANALYTICS_JUDGE_ENABLED", default=False):
+            judge_verdict = self.llm.judge_sql_analytics(question, candidate_sql, self._schema_context)
+            sql_gen_output.intermediate_outputs.append(judge_verdict.model_dump())
+            stats_sink.append(judge_verdict.llm_stats)
+        execution_output = self.executor.run(candidate_sql)
+        return validation_output, candidate_sql, execution_output, judge_verdict
+
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         start = time.perf_counter()
 
@@ -239,27 +272,99 @@ class AnalyticsPipeline:
         sql_gen_output = self.llm.generate_sql(question, self._schema_context)
         sql = sql_gen_output.sql
 
-        # Stage 2: SQL Validation
-        validation_output = SQLValidator.validate(sql, schema_context=self._schema_context)
-        if not validation_output.is_valid:
-            sql = None
-
-        # Stage 2b: SQL analytics judge (opt-in, non-blocking)
-        # WHY: rule-based validation checks structure; this checks analytical intent
-        # (wrong aggregation, missing GROUP BY, wrong granularity). Stored as an
-        # intermediate output — pipeline continues regardless of verdict.
-        sql_judge_llm_stats: dict = {}
-        if _parse_bool_env("SQL_ANALYTICS_JUDGE_ENABLED", default=False) and validation_output.is_valid and sql is not None:
-            verdict = self.llm.judge_sql_analytics(question, sql, self._schema_context)
-            sql_judge_llm_stats = verdict.llm_stats
-            sql_gen_output.intermediate_outputs.append(verdict.model_dump())
-
-        # Stage 3: SQL Execution
-        execution_output = self.executor.run(sql)
+        # Stages 2 / 2b / 3: validate → judge (opt-in) → execute
+        # WHY: _validate_and_execute encapsulates this shared sequence so the
+        # unified correction loop reuses it without duplication.
+        all_extra_stats: list[dict] = []
+        validation_output, sql, execution_output, current_judge_verdict = self._validate_and_execute(
+            question, sql_gen_output.sql, sql_gen_output, all_extra_stats
+        )
         rows = execution_output.rows
 
         # Stage 3b: Result shape signals (informational — never blocks)
         result_validation_output = ResultValidator.validate(execution_output)
+
+        # Unified SQL correction loop (opt-in per trigger type)
+        # WHY: single loop handles all three correction triggers — each counter tracks
+        # independently so one type of correction does not eat another's budget.
+        # History accumulates across all iterations so the LLM sees every prior attempt.
+        # Priority: execution error → analytics judge → result validation.
+        execution_correction_attempts = 0
+        analytics_correction_attempts = 0
+        result_validation_correction_attempts = 0
+        max_execution_retries = int(os.getenv("MAX_SQL_CORRECTION_RETRIES", "3"))
+        max_analytics_retries = int(os.getenv("MAX_SQL_ANALYTICS_CORRECTION_RETRIES", "3"))
+        max_result_validation_retries = int(os.getenv("MAX_RESULT_VALIDATION_CORRECTION_RETRIES", "3"))
+        correction_history: list[dict] = []
+
+        while sql is not None:
+            execution_should_correct = (
+                _parse_bool_env("SQL_CORRECTION_ENABLED", default=False)
+                and execution_output.error is not None
+                and execution_correction_attempts < max_execution_retries
+            )
+            analytics_should_correct = (
+                _parse_bool_env("SQL_ANALYTICS_JUDGE_CORRECTION_ENABLED", default=False)
+                and current_judge_verdict is not None
+                and not current_judge_verdict.verdict
+                and not execution_output.error
+                and analytics_correction_attempts < max_analytics_retries
+            )
+            result_should_correct = (
+                _parse_bool_env("RESULT_VALIDATION_CORRECTION_ENABLED", default=False)
+                and bool(result_validation_output.flags)
+                and not execution_output.error
+                and result_validation_correction_attempts < max_result_validation_retries
+            )
+
+            if not execution_should_correct and not analytics_should_correct and not result_should_correct:
+                break
+
+            # WHY priority: execution error blocks analytics/result checks entirely;
+            # analytics correctness takes priority over result shape since fixing wrong
+            # aggregation often resolves empty results too
+            if execution_should_correct:
+                execution_correction_attempts += 1
+                current_hint = execution_output.error
+                stage_name = "sql_correction"
+            elif analytics_should_correct:
+                analytics_correction_attempts += 1
+                issues_hint = "; ".join(current_judge_verdict.issues) if current_judge_verdict.issues else current_judge_verdict.reason
+                current_hint = f"Analytics judge flagged the SQL as '{current_judge_verdict.grade}'. Issues: {issues_hint}"
+                stage_name = "sql_analytics_correction"
+            else:
+                result_validation_correction_attempts += 1
+                current_hint = f"Result validation flags: {result_validation_output.flags}"
+                stage_name = "sql_result_validation_correction"
+
+            correction_history.append({"sql": sql, "hint": current_hint})
+            history_lines = "\n".join(f"  {i + 1}. SQL: {h['sql']!r}\n     Reason: {h['hint']}" for i, h in enumerate(correction_history))
+            full_hint = f"Previous failed attempts:\n{history_lines}"
+
+            correction = self.llm.correct_sql(question, sql, full_hint, self._schema_context)
+            sql_gen_output.intermediate_outputs.append(
+                {
+                    "stage": stage_name,
+                    "corrected_sql": correction.sql,
+                    "error": correction.error,
+                }
+            )
+            all_extra_stats.append(correction.llm_stats)
+            if correction.sql is None or correction.error:
+                break
+
+            # WHY: only update state when validation passes — invalid corrected SQL
+            # keeps original execution_output so status stays "error" not "unanswerable"
+            _, corrected_sql, corrected_execution, corrected_verdict = self._validate_and_execute(
+                question, correction.sql, sql_gen_output, all_extra_stats
+            )
+            if corrected_sql is None:
+                break
+            sql = corrected_sql
+            execution_output = corrected_execution
+            rows = execution_output.rows
+            current_judge_verdict = corrected_verdict
+            result_validation_output = ResultValidator.validate(execution_output)
 
         # Stage 4: Answer Generation
         answer_output = self.llm.generate_answer(question, sql, rows)
@@ -305,12 +410,11 @@ class AnalyticsPipeline:
         _all_stats = [
             sql_gen_output.llm_stats,
             answer_output.llm_stats,
-            sql_judge_llm_stats,
             answer_judge_llm_stats,
+            *all_extra_stats,
         ]
         total_llm_stats = {
-            key: sum(s.get(key, 0) for s in _all_stats)
-            for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
+            key: sum(s.get(key, 0) for s in _all_stats) for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
         }
         total_llm_stats["model"] = sql_gen_output.llm_stats.get("model", "unknown")
 

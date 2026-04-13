@@ -88,9 +88,9 @@ class OpenRouterLLMClient:
                 messages=messages,
                 model=self.model,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=50000,
                 stream=False,
-                timeout=self._timeout,
+                timeout_ms=self._timeout * 1000,
                 **kwargs,
             )
 
@@ -168,6 +168,25 @@ class OpenRouterLLMClient:
             llm_stats=llm_stats,
             error=error,
         )
+
+    def correct_sql(
+        self,
+        question: str,
+        failed_sql: str,
+        db_error: str,
+        context: dict,
+    ) -> SQLGenerationOutput:
+        """Re-generate SQL with the DB error as correction context.
+
+        WHY: delegates to generate_sql() to avoid duplicating LLM call machinery.
+        The correction_hint injected into context tells the LLM exactly what went
+        wrong so it can fix the specific problem rather than regenerating blind.
+        """
+        augmented = {
+            **context,
+            "correction_hint": (f"The previous SQL failed. Fix it.\nFailed SQL: {failed_sql}\nDB error: {db_error}"),
+        }
+        return self.generate_sql(question, augmented)
 
     def generate_answer(self, question: str, sql: str | None, rows: list[dict[str, Any]]) -> AnswerGenerationOutput:
         if not sql:
