@@ -4,6 +4,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from dotenv import load_dotenv
+
+# WHY: load test-specific env before any src import triggers load_dotenv() on the
+# production .env — override=True ensures .env.test values win even if .env was
+# already loaded by a previous import
+load_dotenv(Path(__file__).resolve().parents[1] / ".env.test", override=True)
 
 
 @pytest.fixture

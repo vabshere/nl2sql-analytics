@@ -194,6 +194,24 @@ class _AlwaysErrorExecutorStub:
         return SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0, error="always fails")
 
 
+class _LLMInvalidThenValid(BaseLLMStub):
+    """generate_sql returns a non-SELECT statement; correct_sql returns valid SELECT."""
+
+    def generate_sql(self, question, context):
+        return SQLGenerationOutput(
+            sql="DELETE FROM gaming_mental_health",
+            timing_ms=0.0,
+            llm_stats=_zero_stats(),
+        )
+
+    def correct_sql(self, question, failed_sql, db_error, context):
+        return SQLGenerationOutput(
+            sql="SELECT age FROM gaming_mental_health",
+            timing_ms=0.0,
+            llm_stats=_zero_stats(),
+        )
+
+
 def test_execution_correction_hint_accumulates_history(analytics_db, schema_description_db, monkeypatch):
     """On the 2nd correction call the hint must include both prior sql+error pairs."""
     monkeypatch.setenv("SQL_CORRECTION_ENABLED", "true")
@@ -315,3 +333,18 @@ def test_result_validation_correction_bounded_by_max_retries(analytics_db, schem
     output = pipeline.run("What are the ages?")
     result_entries = [d for d in output.sql_generation.intermediate_outputs if d.get("stage") == "sql_result_validation_correction"]
     assert len(result_entries) == 2
+
+
+# ---------------------------------------------------------------------------
+# Validation failure correction
+# ---------------------------------------------------------------------------
+
+
+def test_correction_recovers_on_validation_error(analytics_db_with_data, schema_description_db, monkeypatch):
+    """When SQL fails validation and SQL_CORRECTION_ENABLED=true, corrected SQL is used."""
+    monkeypatch.setenv("SQL_CORRECTION_ENABLED", "true")
+    llm = _LLMInvalidThenValid()
+    pipeline = _make_pipeline(llm, analytics_db_with_data, schema_description_db)
+    output = pipeline.run("What are the ages?")
+    assert output.status == "success"
+    assert any(d.get("stage") == "sql_correction" for d in output.sql_generation.intermediate_outputs)

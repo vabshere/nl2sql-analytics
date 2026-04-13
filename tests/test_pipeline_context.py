@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
+    from helpers import BaseLLMStub
     from src.pipeline import AnalyticsPipeline
     from src.types import AnswerGenerationOutput, SQLGenerationOutput
 except ImportError as exc:
@@ -36,9 +37,9 @@ class _CapturingLLM:
 
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
         self.received_contexts.append(context)
-        # WHY: return a harmless SELECT so pipeline execution succeeds
+        # WHY: reference a real table so SQL validation passes and correction is not triggered
         return SQLGenerationOutput(
-            sql="SELECT 1 AS x",
+            sql="SELECT age FROM gaming_mental_health",
             timing_ms=0.0,
             llm_stats=dict(_ZERO_LLM_STATS),
             error=None,

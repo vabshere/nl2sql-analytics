@@ -47,7 +47,8 @@ def _exec(rows: list[dict], error: str | None = None) -> SQLExecutionOutput:
         ([{"label": "0"}, {"label": "0"}], None),
     ],
 )
-def test_result_flags(rows, expected_flag):
+def test_result_flags(rows, expected_flag, monkeypatch):
+    monkeypatch.setenv("RESULT_VALIDATION_ENABLED", "true")
     result = ResultValidator.validate(_exec(rows=rows))
     if expected_flag:
         assert expected_flag in result.flags
@@ -93,7 +94,8 @@ def test_env_var_gate(monkeypatch, env_val, expect_flag):
 # ---------------------------------------------------------------------------
 
 
-def test_rows_truncated_flagged(analytics_db_101_rows):
+def test_rows_truncated_flagged(analytics_db_101_rows, monkeypatch):
+    monkeypatch.setenv("RESULT_VALIDATION_ENABLED", "true")
     executor = SQLiteExecutor(analytics_db_101_rows)
     exec_out = executor.run("SELECT * FROM gaming_mental_health")
     assert exec_out.rows_truncated is True

@@ -255,7 +255,7 @@ class AnalyticsPipeline:
         """
         validation_output = SQLValidator.validate(candidate_sql, schema_context=self._schema_context)
         if not validation_output.is_valid:
-            return validation_output, None, SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0), None
+            return validation_output, candidate_sql, SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0), None
         # WHY: judge is opt-in and non-blocking; stats appended to sink for aggregation
         judge_verdict: SQLAnalyticsJudgeOutput | None = None
         if _parse_bool_env("SQL_ANALYTICS_JUDGE_ENABLED", default=False):
@@ -263,7 +263,6 @@ class AnalyticsPipeline:
             sql_gen_output.intermediate_outputs.append(judge_verdict.model_dump())
             stats_sink.append(judge_verdict.llm_stats)
         execution_output = self.executor.run(candidate_sql)
-        l = len(execution_output.rows) if len(execution_output.rows) <= 3 else 3
         return validation_output, candidate_sql, execution_output, judge_verdict
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
@@ -301,7 +300,7 @@ class AnalyticsPipeline:
         while sql is not None:
             execution_should_correct = (
                 _parse_bool_env("SQL_CORRECTION_ENABLED", default=False)
-                and execution_output.error is not None
+                and (not validation_output.is_valid or execution_output.error is not None)
                 and execution_correction_attempts < max_execution_retries
             )
             analytics_should_correct = (
@@ -313,6 +312,7 @@ class AnalyticsPipeline:
             )
             result_should_correct = (
                 _parse_bool_env("RESULT_VALIDATION_CORRECTION_ENABLED", default=False)
+                and validation_output.is_valid  # WHY: result signals are only meaningful after a successful execution
                 and bool(result_validation_output.flags)
                 and not execution_output.error
                 and result_validation_correction_attempts < max_result_validation_retries
@@ -326,7 +326,8 @@ class AnalyticsPipeline:
             # aggregation often resolves empty results too
             if execution_should_correct:
                 execution_correction_attempts += 1
-                current_hint = execution_output.error
+                # WHY: validation failure has no execution error — use the validation message instead
+                current_hint = validation_output.error if not validation_output.is_valid else execution_output.error
                 stage_name = "sql_correction"
             elif analytics_should_correct:
                 analytics_correction_attempts += 1
@@ -354,14 +355,16 @@ class AnalyticsPipeline:
             if correction.sql is None or correction.error:
                 break
 
-            # WHY: only update state when validation passes — invalid corrected SQL
-            # keeps original execution_output so status stays "error" not "unanswerable"
-            _, corrected_sql, corrected_execution, corrected_verdict = self._validate_and_execute(
+            corrected_validation, corrected_sql, corrected_execution, corrected_verdict = self._validate_and_execute(
                 question, correction.sql, sql_gen_output, all_extra_stats
             )
-            if corrected_sql is None:
-                break
+            # WHY: always update sql + validation_output so correction_history reflects
+            # the latest attempted SQL and its failure reason on subsequent iterations
             sql = corrected_sql
+            validation_output = corrected_validation
+            if not corrected_validation.is_valid:
+                # Corrected SQL also invalid — loop retries if budget allows
+                continue
             execution_output = corrected_execution
             rows = execution_output.rows
             current_judge_verdict = corrected_verdict
