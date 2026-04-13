@@ -11,9 +11,10 @@ from sqlglot.errors import ErrorLevel
 from sqlglot.optimizer.simplify import simplify
 
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
-from src.schema_context import load_schema_context
+from src.schema_context import _parse_bool_env, load_schema_context
 from src.types import (
     PipelineOutput,
+    ResultValidationOutput,
     SQLExecutionOutput,
     SQLValidationOutput,
 )
@@ -136,6 +137,63 @@ class SQLiteExecutor:
         )
 
 
+class ResultValidator:
+    @classmethod
+    def validate(cls, execution_output: SQLExecutionOutput) -> ResultValidationOutput:
+        """Collect post-execution result shape signals.
+
+        WHY: these are monitoring/observability flags only — never block the pipeline.
+        The empty-rows answer path is already handled in generate_answer(); this
+        adds structured metadata for logging and potential future correction loops.
+        """
+        start = time.perf_counter()
+
+        # WHY: honour env var to allow disabling result signals in environments
+        # where the checks add no value (e.g. benchmark runs that don't need them)
+        if not _parse_bool_env("RESULT_VALIDATION_ENABLED", default=True):
+            return ResultValidationOutput(flags=[], timing_ms=0.0)
+
+        # WHY: if execution itself errored, rows may be empty/partial for reasons
+        # unrelated to query semantics — skip checks to avoid false signals
+        if execution_output.error is not None:
+            return ResultValidationOutput(
+                flags=[],
+                timing_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        flags: list[str] = []
+        rows = execution_output.rows
+
+        # Flag 1: empty result (SQL ran successfully but returned no rows)
+        if not rows:
+            flags.append("empty_result")
+            return ResultValidationOutput(
+                flags=flags,
+                timing_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        # Flag 2 & 3: column-level signals (only meaningful when rows exist)
+        cols = rows[0].keys()
+        for col in cols:
+            values = [row[col] for row in rows]
+
+            # all_null_column: every value is None
+            if all(v is None for v in values):
+                flags.append(f"all_null_column:{col}")
+                continue
+
+            # all_zero_column: every numeric value is 0 / 0.0
+            # WHY: only check numeric types — text "0" is not a zero signal
+            numeric_values = [v for v in values if isinstance(v, (int, float))]
+            if numeric_values and len(numeric_values) == len(values) and all(v == 0 for v in numeric_values):
+                flags.append(f"all_zero_column:{col}")
+
+        return ResultValidationOutput(
+            flags=flags,
+            timing_ms=(time.perf_counter() - start) * 1000,
+        )
+
+
 class AnalyticsPipeline:
     def __init__(
         self,
@@ -175,12 +233,34 @@ class AnalyticsPipeline:
         if not validation_output.is_valid:
             sql = None
 
+        # Stage 2b: SQL analytics judge (opt-in, non-blocking)
+        # WHY: rule-based validation checks structure; this checks analytical intent
+        # (wrong aggregation, missing GROUP BY, wrong granularity). Stored as an
+        # intermediate output — pipeline continues regardless of verdict.
+        sql_judge_llm_stats: dict = {}
+        if _parse_bool_env("SQL_ANALYTICS_JUDGE_ENABLED", default=False) and validation_output.is_valid and sql is not None:
+            verdict = self.llm.judge_sql_analytics(question, sql, self._schema_context)
+            sql_judge_llm_stats = verdict.llm_stats
+            sql_gen_output.intermediate_outputs.append(verdict.model_dump())
+
         # Stage 3: SQL Execution
         execution_output = self.executor.run(sql)
         rows = execution_output.rows
 
+        # Stage 3b: Result shape signals (informational — never blocks)
+        result_validation_output = ResultValidator.validate(execution_output)
+
         # Stage 4: Answer Generation
         answer_output = self.llm.generate_answer(question, sql, rows)
+
+        # Stage 4b: Answer grounding judge (opt-in, non-blocking)
+        # WHY: skip when sql or rows are absent — the fallback answer paths have
+        # no substantive data to verify against, making grounding checks meaningless
+        answer_judge_llm_stats: dict = {}
+        if _parse_bool_env("ANSWER_GROUNDING_JUDGE_ENABLED", default=False) and sql is not None and rows:
+            verdict = self.llm.judge_answer_grounding(question, sql, rows, answer_output.answer)
+            answer_judge_llm_stats = verdict.llm_stats
+            answer_output.intermediate_outputs.append(verdict.model_dump())
 
         # Determine status
         status = "success"
@@ -203,13 +283,17 @@ class AnalyticsPipeline:
         }
 
         # Build total LLM stats
+        _all_stats = [
+            sql_gen_output.llm_stats,
+            answer_output.llm_stats,
+            sql_judge_llm_stats,
+            answer_judge_llm_stats,
+        ]
         total_llm_stats = {
-            "llm_calls": sql_gen_output.llm_stats.get("llm_calls", 0) + answer_output.llm_stats.get("llm_calls", 0),
-            "prompt_tokens": sql_gen_output.llm_stats.get("prompt_tokens", 0) + answer_output.llm_stats.get("prompt_tokens", 0),
-            "completion_tokens": sql_gen_output.llm_stats.get("completion_tokens", 0) + answer_output.llm_stats.get("completion_tokens", 0),
-            "total_tokens": sql_gen_output.llm_stats.get("total_tokens", 0) + answer_output.llm_stats.get("total_tokens", 0),
-            "model": sql_gen_output.llm_stats.get("model", "unknown"),
+            key: sum(s.get(key, 0) for s in _all_stats)
+            for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
         }
+        total_llm_stats["model"] = sql_gen_output.llm_stats.get("model", "unknown")
 
         return PipelineOutput(
             status=status,
@@ -224,4 +308,5 @@ class AnalyticsPipeline:
             answer=answer_output.answer,
             timings=timings,
             total_llm_stats=total_llm_stats,
+            result_validation=result_validation_output,
         )

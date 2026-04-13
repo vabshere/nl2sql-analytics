@@ -1,23 +1,27 @@
 from __future__ import annotations
-
-import json
-import os
-import time
-from typing import Any
-
+from src.types import (
+    AnswerGenerationOutput,
+    AnswerGroundingJudgeOutput,
+    JudgeResponse,
+    SQLAnalyticsJudgeOutput,
+    SQLGenerationOutput,
+    SQLResponse,
+)
 from openrouter.components.chatformatjsonschemaconfig import (
     ChatFormatJSONSchemaConfig,
     ChatJSONSchemaConfig,
 )
-from pydantic import BaseModel
 
-from src.types import SQLGenerationOutput, AnswerGenerationOutput
+import json
+import logging
+import os
+import time
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
 
 DEFAULT_MODEL = "openai/gpt-5-nano"
-
-
-class SQLResponse(BaseModel):
-    sql: str | None
 
 
 class OpenRouterLLMClient:
@@ -194,6 +198,123 @@ class OpenRouterLLMClient:
             llm_stats=llm_stats,
             error=error,
         )
+
+    def judge_sql_analytics(
+        self,
+        question: str,
+        sql: str,
+        schema_context: dict,
+    ) -> SQLAnalyticsJudgeOutput:
+        """Evaluate whether the SQL is analytically correct for the question.
+
+        WHY: rule-based validators check SQL structure; this checks analytical
+        intent — wrong aggregation function, missing GROUP BY, wrong granularity.
+        Non-blocking: result is stored in intermediate_outputs only.
+
+        Returns a dict ready to append to SQLGenerationOutput.intermediate_outputs.
+        """
+        system_prompt = (
+            "You are an expert analytics SQL reviewer. "
+            "Evaluate whether a SQL query correctly implements the analytical intent "
+            "of a natural language question. "
+            "Consider: (1) aggregation — does the query aggregate when the question "
+            "asks for a summary (average, count, total)? (2) grouping — does GROUP BY "
+            "match the breakdown dimension in the question? (3) filtering — is the "
+            "WHERE clause consistent with the question's scope? (4) granularity — "
+            "does the result shape match what the question expects?"
+        )
+        user_prompt = f"Question: {question}\n\nSQL:\n{sql}\n\nSchema:\n{schema_context.get('ddl', '')}"
+
+        try:
+            text = self._chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=20000,
+                response_format=ChatFormatJSONSchemaConfig(
+                    type="json_schema",
+                    json_schema=ChatJSONSchemaConfig(
+                        name="sql_analytics_judge_output",
+                        schema_=JudgeResponse.model_json_schema(),
+                        strict=True,
+                    ),
+                ),
+            )
+            parsed = JudgeResponse.model_validate_json(text)
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return SQLAnalyticsJudgeOutput(
+                verdict=parsed.verdict,
+                grade=parsed.grade,
+                issues=parsed.issues,
+                reason=parsed.reason,
+                llm_stats=llm_stats,
+            )
+        except Exception as exc:
+            logger.warning("sql_analytics_judge failed: %s", exc)
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return SQLAnalyticsJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
+
+    def judge_answer_grounding(
+        self,
+        question: str,
+        sql: str,
+        rows: list[dict[str, Any]],
+        answer: str,
+    ) -> AnswerGroundingJudgeOutput:
+        """Evaluate whether the answer is grounded in the SQL results.
+
+        WHY: generate_answer() uses a constrained system prompt but cannot
+        self-verify. This provides an independent post-generation check.
+        Non-blocking: result stored in intermediate_outputs only.
+
+        Returns a dict ready to append to AnswerGenerationOutput.intermediate_outputs.
+        """
+        system_prompt = (
+            "You are an answer quality auditor for a data analytics system. "
+            "Verify that the answer is grounded in the provided data rows — "
+            "it should not state values, entities, or conclusions not present in the rows."
+        )
+        # WHY: include only result rows (not full schema) — Arize AI research shows
+        # judge performance improves when limited to data actually in scope
+        rows_sample = json.dumps(rows[:30], ensure_ascii=True)
+        user_prompt = f"Question: {question}\n\nSQL:\n{sql}\n\nData rows (up to 10):\n{rows_sample}\n\nAnswer to verify:\n{answer}"
+
+        try:
+            text = self._chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=20000,
+                response_format=ChatFormatJSONSchemaConfig(
+                    type="json_schema",
+                    json_schema=ChatJSONSchemaConfig(
+                        name="answer_grounding_judge_output",
+                        schema_=JudgeResponse.model_json_schema(),
+                        strict=True,
+                    ),
+                ),
+            )
+            parsed = JudgeResponse.model_validate_json(text)
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return AnswerGroundingJudgeOutput(
+                verdict=parsed.verdict,
+                grade=parsed.grade,
+                issues=parsed.issues,
+                reason=parsed.reason,
+                llm_stats=llm_stats,
+            )
+        except Exception as exc:
+            logger.warning("answer_grounding_judge failed: %s", exc)
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return AnswerGroundingJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
 
     def pop_stats(self) -> dict[str, Any]:
         out = dict(self._stats or {})

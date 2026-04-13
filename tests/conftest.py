@@ -26,6 +26,23 @@ def analytics_db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def analytics_db_with_data(tmp_path: Path) -> Path:
+    """gaming_mental_health DB with sample rows so SQL queries return results."""
+    db = tmp_path / "gaming_mental_health.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE gaming_mental_health (age INTEGER, gender TEXT, playtime_hours REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO gaming_mental_health VALUES (?, ?, ?)",
+        [(25, "Male", 12.5), (30, "Female", 10.2), (22, "Male", 8.0)],
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+@pytest.fixture
 def schema_description_db(tmp_path: Path) -> Path:
     """Minimal schema_metadata SQLite DB with table + 2 column descriptions."""
     db = tmp_path / "schema_metadata.sqlite"

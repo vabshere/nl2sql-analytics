@@ -70,7 +70,8 @@ def test_build_ddl_without_descriptions():
 
 def test_build_ddl_with_descriptions():
     ddl = build_ddl(
-        SAMPLE_COLUMNS, TABLE_NAME,
+        SAMPLE_COLUMNS,
+        TABLE_NAME,
         "Gaming and Mental Health Behavioral Dataset",
         SAMPLE_DESCRIPTIONS,
         include_description=True,
@@ -117,10 +118,13 @@ def test_load_schema_context_default(analytics_db, schema_description_db, monkey
     assert TABLE_NAME in result["column_types"]
 
 
-@pytest.mark.parametrize("env_value,expected_in_ddl", [
-    ("true", "-- Age of the participant"),
-    ("false", None),
-])
+@pytest.mark.parametrize(
+    "env_value,expected_in_ddl",
+    [
+        ("true", "-- Age of the participant"),
+        ("false", None),
+    ],
+)
 def test_load_schema_context_respects_schema_include_description_env(
     analytics_db, schema_description_db, monkeypatch, env_value, expected_in_ddl
 ):
