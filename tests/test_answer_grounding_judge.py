@@ -168,3 +168,61 @@ def test_judge_skipped_when_no_data(analytics_db, schema_description_db, monkeyp
     pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
     pipeline.run("any question")
     assert llm.grounding_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Answer grounding correction loop
+# ---------------------------------------------------------------------------
+
+
+class _LLMGroundingAlwaysFail(BaseLLMStub):
+    """judge_answer_grounding always fails; generate_answer records call count."""
+
+    def __init__(self):
+        self.generate_answer_calls: int = 0
+
+    def generate_sql(self, question, context):
+        return SQLGenerationOutput(
+            sql="SELECT gender, AVG(playtime_hours) AS avg FROM gaming_mental_health GROUP BY gender",
+            timing_ms=0.0,
+            llm_stats=dict(_ZERO_STATS),
+        )
+
+    def generate_answer(self, question, sql, rows, correction_hint: str = ""):
+        from src.types import AnswerGenerationOutput
+        self.generate_answer_calls += 1
+        return AnswerGenerationOutput(
+            answer=f"stub answer #{self.generate_answer_calls}",
+            timing_ms=0.0,
+            llm_stats=dict(_ZERO_STATS),
+        )
+
+    def judge_answer_grounding(self, question, sql, rows, answer):
+        return AnswerGroundingJudgeOutput(
+            verdict=False, grade="fail", issues=["hallucinated value"], reason="not grounded",
+            llm_stats=dict(_ZERO_STATS),
+        )
+
+
+def test_answer_grounding_correction_triggered_on_fail(analytics_db_with_data, schema_description_db, monkeypatch):
+    """When grounding judge fails and correction is enabled, generate_answer is called again."""
+    monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_ENABLED", "true")
+    monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", "true")
+    monkeypatch.setenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "1")
+    llm = _LLMGroundingAlwaysFail()
+    pipeline = AnalyticsPipeline(db_path=analytics_db_with_data, llm_client=llm, metadata_db_path=schema_description_db)
+    output = pipeline.run("What is the average playtime by gender?")
+    assert llm.generate_answer_calls > 1
+    assert any(d.get("stage") == "answer_grounding_correction" for d in output.answer_generation.intermediate_outputs)
+
+
+def test_answer_grounding_correction_bounded_by_max_retries(analytics_db_with_data, schema_description_db, monkeypatch):
+    """Answer grounding correction stops after MAX_ANSWER_GROUNDING_CORRECTION_RETRIES attempts."""
+    monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_ENABLED", "true")
+    monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", "true")
+    monkeypatch.setenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "2")
+    llm = _LLMGroundingAlwaysFail()
+    pipeline = AnalyticsPipeline(db_path=analytics_db_with_data, llm_client=llm, metadata_db_path=schema_description_db)
+    output = pipeline.run("What is the average playtime by gender?")
+    correction_entries = [d for d in output.answer_generation.intermediate_outputs if d.get("stage") == "answer_grounding_correction"]
+    assert len(correction_entries) == 2

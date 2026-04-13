@@ -373,14 +373,43 @@ class AnalyticsPipeline:
         # Stage 4: Answer Generation
         answer_output = self.llm.generate_answer(question, sql, rows)
 
-        # Stage 4b: Answer grounding judge (opt-in, non-blocking)
+        # Stage 4b: Answer grounding judge + correction loop (opt-in, non-blocking)
         # WHY: skip when sql or rows are absent — the fallback answer paths have
         # no substantive data to verify against, making grounding checks meaningless
         answer_judge_llm_stats: dict = {}
         if _parse_bool_env("ANSWER_GROUNDING_JUDGE_ENABLED", default=False) and sql is not None and rows:
-            verdict = self.llm.judge_answer_grounding(question, sql, rows, answer_output.answer)
-            answer_judge_llm_stats = verdict.llm_stats
-            answer_output.intermediate_outputs.append(verdict.model_dump())
+            grounding_verdict = self.llm.judge_answer_grounding(question, sql, rows, answer_output.answer)
+            answer_judge_llm_stats = grounding_verdict.llm_stats
+            answer_output.intermediate_outputs.append(grounding_verdict.model_dump())
+
+            answer_grounding_correction_attempts = 0
+            max_answer_grounding_retries = int(os.getenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "3"))
+            # WHY: re-generate answer with same sql+rows — grounding failures are answer
+            # phrasing issues, not data retrieval issues; no SQL re-generation needed
+            while (
+                _parse_bool_env("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", default=False)
+                and not grounding_verdict.verdict
+                and answer_grounding_correction_attempts < max_answer_grounding_retries
+            ):
+                answer_grounding_correction_attempts += 1
+                issues_text = "; ".join(grounding_verdict.issues) if grounding_verdict.issues else grounding_verdict.reason
+                correction_hint = f"Previous answer was not grounded in the data. Issues: {issues_text}\nPrevious answer: {answer_output.answer}"
+                corrected_answer_output = self.llm.generate_answer(question, sql, rows, correction_hint=correction_hint)
+                all_extra_stats.append(corrected_answer_output.llm_stats)
+                answer_output.intermediate_outputs.append({
+                    "stage": "answer_grounding_correction",
+                    "corrected_answer": corrected_answer_output.answer,
+                    "error": corrected_answer_output.error,
+                })
+                if corrected_answer_output.error:
+                    break
+                # WHY: carry over accumulated intermediate_outputs before replacing —
+                # corrected_answer_output starts with an empty list
+                corrected_answer_output.intermediate_outputs = answer_output.intermediate_outputs
+                answer_output = corrected_answer_output
+                grounding_verdict = self.llm.judge_answer_grounding(question, sql, rows, answer_output.answer)
+                all_extra_stats.append(grounding_verdict.llm_stats)
+                answer_output.intermediate_outputs.append(grounding_verdict.model_dump())
 
         # Determine status — check every stage error in pipeline order
         # WHY: explicitly listing answer_output.error as the final error check ensures

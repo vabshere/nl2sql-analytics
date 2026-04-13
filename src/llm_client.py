@@ -103,7 +103,11 @@ ROWS:
 
 ROW COUNT:
 {{ count }}\
-""")
+{% if correction_hint %}
+
+CORRECTION CONTEXT:
+{{ correction_hint }}
+{% endif %}""")
 
 # ── SQL Analytics Judge ───────────────────────────────────────────────────────
 
@@ -291,6 +295,7 @@ class OpenRouterLLMClient:
         question: str,
         sql: str,
         rows: list[dict],
+        correction_hint: str = "",
     ) -> list[dict]:
         rows_sample = rows[:30]
         # WHY: columns listed separately so the model reasons about result shape
@@ -306,6 +311,7 @@ class OpenRouterLLMClient:
                     columns=columns,
                     rows=json.dumps(rows_sample, ensure_ascii=True),
                     count=len(rows),
+                    correction_hint=correction_hint,
                 ),
             },
         ]
@@ -403,7 +409,7 @@ class OpenRouterLLMClient:
         }
         return self.generate_sql(question, augmented)
 
-    def generate_answer(self, question: str, sql: str | None, rows: list[dict[str, Any]]) -> AnswerGenerationOutput:
+    def generate_answer(self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = "") -> AnswerGenerationOutput:
         if not sql:
             return AnswerGenerationOutput(
                 answer="I cannot answer this with the available table and schema. Please rephrase using known survey fields.",
@@ -437,7 +443,7 @@ class OpenRouterLLMClient:
 
         try:
             answer = self._chat(
-                messages=self._build_answer_generation_messages(question, sql, rows),
+                messages=self._build_answer_generation_messages(question, sql, rows, correction_hint=correction_hint),
                 temperature=0.2,
                 max_tokens=220,
             )

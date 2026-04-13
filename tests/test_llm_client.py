@@ -69,6 +69,11 @@ class TestBuildAnswerGenerationMessages:
         rows_section = user.split("ROWS:\n")[1].split("\n\nROW COUNT")[0]
         assert len(json.loads(rows_section)) == 30     # capped at 30
 
+    def test_correction_hint_present_when_set(self):
+        rows = [{"x": 1}]
+        msgs = OpenRouterLLMClient._build_answer_generation_messages("q", "SELECT ...", rows, correction_hint="foo bar")
+        assert "foo bar" in msgs[1]["content"]
+
 
 
 # ---------------------------------------------------------------------------
