@@ -117,6 +117,7 @@ class SQLiteExecutor:
                 error=None,
             )
 
+        rows_truncated = False
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -124,6 +125,11 @@ class SQLiteExecutor:
                 cur.execute(sql)
                 rows = [dict(r) for r in cur.fetchmany(100)]
                 row_count = len(rows)
+                # WHY: probe for a 101st row only when the batch is full — if fewer
+                # than 100 rows came back we already know there was no truncation and
+                # the extra fetchone() round-trip is unnecessary
+                if row_count == 100:
+                    rows_truncated = cur.fetchone() is not None
         except Exception as exc:
             error = str(exc)
             rows = []
@@ -134,6 +140,7 @@ class SQLiteExecutor:
             row_count=row_count,
             timing_ms=(time.perf_counter() - start) * 1000,
             error=error,
+            rows_truncated=rows_truncated,
         )
 
 
@@ -172,7 +179,11 @@ class ResultValidator:
                 timing_ms=(time.perf_counter() - start) * 1000,
             )
 
-        # Flag 2 & 3: column-level signals (only meaningful when rows exist)
+        # Flag 2: result was truncated at 100 rows (more rows exist in the DB)
+        if execution_output.rows_truncated:
+            flags.append("rows_truncated")
+
+        # Flag 3 & 4: column-level signals (only meaningful when rows exist)
         cols = rows[0].keys()
         for col in cols:
             values = [row[col] for row in rows]
@@ -262,16 +273,24 @@ class AnalyticsPipeline:
             answer_judge_llm_stats = verdict.llm_stats
             answer_output.intermediate_outputs.append(verdict.model_dump())
 
-        # Determine status
+        # Determine status — check every stage error in pipeline order
+        # WHY: explicitly listing answer_output.error as the final error check ensures
+        # every stage's failure is represented, and the ordering preserves existing
+        # precedence (sql failures > execution failures > answer failures)
         status = "success"
         if sql_gen_output.sql is None and sql_gen_output.error:
+            # LLM could not produce SQL
             status = "unanswerable"
         elif not validation_output.is_valid:
             status = "invalid_sql"
         elif execution_output.error:
             status = "error"
         elif sql is None:
+            # Validation cleared but sql was reset (e.g. always-true WHERE → invalid)
             status = "unanswerable"
+        elif answer_output.error:
+            # Answer generation failed after successful SQL execution
+            status = "error"
 
         # Build timings aggregate
         timings = {

@@ -18,7 +18,20 @@ import os
 import time
 from typing import Any
 
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    """Return True for transient errors worth retrying; False for permanent failures.
+
+    WHY: non-retryable errors (auth, bad request) will fail identically on every
+    retry attempt, wasting quota and adding latency. Only retry errors that can
+    resolve on their own (rate limits, transient server failures).
+    """
+    msg = str(exc).lower()
+    return any(token in msg for token in ("429", "500", "503", "rate limit", "overloaded"))
 
 
 DEFAULT_MODEL = "openai/gpt-5-nano"
@@ -42,6 +55,12 @@ class OpenRouterLLMClient:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        # WHY: LLM inference can take 5–30s; no timeout means a hung call blocks
+        # the pipeline indefinitely — default 60s is generous but bounded
+        self._timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+        # WHY: configurable so callers can reduce retries in test/latency-sensitive
+        # contexts without changing code
+        self._max_retries = int(os.getenv("LLM_MAX_RETRIES", "0"))
 
     def _chat(
         self,
@@ -54,14 +73,28 @@ class OpenRouterLLMClient:
         if response_format is not None:
             kwargs["response_format"] = response_format
 
-        res = self._client.chat.send(
-            messages=messages,
-            model=self.model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
-            **kwargs,
+        # WHY: wrap only the SDK call (not the full method) so that stats
+        # increment and response parsing happen exactly once on success, not
+        # once per retry attempt. Exponential backoff with jitter avoids
+        # thundering-herd effects when multiple calls retry simultaneously.
+        @retry(
+            retry=retry_if_exception(_is_retryable_llm_error),
+            stop=stop_after_attempt(self._max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            reraise=True,
         )
+        def _send():
+            return self._client.chat.send(
+                messages=messages,
+                model=self.model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                timeout=self._timeout,
+                **kwargs,
+            )
+
+        res = _send()
 
         # WHY: llm_calls is always incremented regardless of whether usage is
         # present — some models/providers may return None usage on errors.

@@ -103,6 +103,9 @@ class SQLExecutionOutput:
     row_count: int
     timing_ms: float
     error: str | None = None
+    # WHY: fetchmany(100) silently drops rows beyond the limit; this flag lets callers
+    # detect truncation without a second query
+    rows_truncated: bool = False
 
 
 @dataclass

@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     from helpers import BaseLLMStub, _ZERO_STATS
-    from src.pipeline import AnalyticsPipeline, ResultValidator
+    from src.pipeline import AnalyticsPipeline, ResultValidator, SQLiteExecutor
     from src.types import ResultValidationOutput, SQLExecutionOutput
 except ImportError as exc:
     raise RuntimeError("Could not import project modules. Run from project root.") from exc
@@ -86,6 +86,37 @@ def test_env_var_gate(monkeypatch, env_val, expect_flag):
     else:
         assert result.flags == []
         assert result.timing_ms == 0.0
+
+
+# ---------------------------------------------------------------------------
+# row truncation signal
+# ---------------------------------------------------------------------------
+
+
+def test_rows_truncated_flagged(analytics_db_101_rows):
+    executor = SQLiteExecutor(analytics_db_101_rows)
+    exec_out = executor.run("SELECT * FROM gaming_mental_health")
+    assert exec_out.rows_truncated is True
+    assert len(exec_out.rows) == 100
+    result = ResultValidator.validate(exec_out)
+    assert "rows_truncated" in result.flags
+
+
+def test_rows_not_truncated_not_flagged(analytics_db_with_data):
+    executor = SQLiteExecutor(analytics_db_with_data)
+    exec_out = executor.run("SELECT * FROM gaming_mental_health")
+    assert exec_out.rows_truncated is False
+    result = ResultValidator.validate(exec_out)
+    assert "rows_truncated" not in result.flags
+
+
+def test_exactly_100_rows_no_truncation(analytics_db_100_rows):
+    executor = SQLiteExecutor(analytics_db_100_rows)
+    exec_out = executor.run("SELECT * FROM gaming_mental_health")
+    assert exec_out.rows_truncated is False
+    assert len(exec_out.rows) == 100
+    result = ResultValidator.validate(exec_out)
+    assert "rows_truncated" not in result.flags
 
 
 # ---------------------------------------------------------------------------

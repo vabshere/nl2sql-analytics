@@ -43,6 +43,40 @@ def analytics_db_with_data(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def analytics_db_101_rows(tmp_path: Path) -> Path:
+    """gaming_mental_health DB with 101 rows — enough to trigger fetchmany(100) truncation."""
+    db = tmp_path / "gaming_mental_health.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE gaming_mental_health (age INTEGER, gender TEXT, playtime_hours REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO gaming_mental_health VALUES (?, ?, ?)",
+        [(i, "Male", float(i)) for i in range(101)],
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+@pytest.fixture
+def analytics_db_100_rows(tmp_path: Path) -> Path:
+    """gaming_mental_health DB with exactly 100 rows — fetchone() after fetchmany(100) returns None."""
+    db = tmp_path / "gaming_mental_health.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE gaming_mental_health (age INTEGER, gender TEXT, playtime_hours REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO gaming_mental_health VALUES (?, ?, ?)",
+        [(i, "Male", float(i)) for i in range(100)],
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+@pytest.fixture
 def schema_description_db(tmp_path: Path) -> Path:
     """Minimal schema_metadata SQLite DB with table + 2 column descriptions."""
     db = tmp_path / "schema_metadata.sqlite"

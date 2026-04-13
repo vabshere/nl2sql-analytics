@@ -2,3 +2,4 @@ openrouter
 pandas
 python-dotenv
 sqlglot
+tenacity
