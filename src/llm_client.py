@@ -162,13 +162,27 @@ ANSWER:
 logger = logging.getLogger(__name__)
 
 
+class LLMTokenLimitError(RuntimeError):
+    """Raised when the LLM truncates its response because it hit the token cap.
+
+    WHY: a distinct exception type lets callers (and _is_retryable_llm_error)
+    distinguish token-limit exhaustion from transient transport errors.
+    Retrying with the same parameters would produce the same truncated output,
+    so this error must NOT be retried — only the signal should be logged.
+    """
+
+
 def _is_retryable_llm_error(exc: Exception) -> bool:
     """Return True for transient errors worth retrying; False for permanent failures.
 
     WHY: non-retryable errors (auth, bad request) will fail identically on every
     retry attempt, wasting quota and adding latency. Only retry errors that can
     resolve on their own (rate limits, transient server failures).
+    LLMTokenLimitError is explicitly excluded — retrying with the same parameters
+    would produce the same truncated output every time.
     """
+    if isinstance(exc, LLMTokenLimitError):
+        return False
     msg = str(exc).lower()
     return any(token in msg for token in ("429", "500", "503", "rate limit", "overloaded"))
 
@@ -251,6 +265,18 @@ class OpenRouterLLMClient:
         choices = getattr(res, "choices", None) or []
         if not choices:
             raise RuntimeError("OpenRouter response contained no choices.")
+
+        # WHY: finish_reason "length" means the model hit its token cap and the
+        # response is truncated. Retrying with the same parameters would produce
+        # the same truncated output — raise a distinct non-retryable error so
+        # callers get a clear signal instead of a confusing JSON parse failure.
+        finish_reason = getattr(choices[0], "finish_reason", None)
+        if finish_reason == "length":
+            raise LLMTokenLimitError(
+                "LLM response truncated (finish_reason=length): "
+                "the model hit its token cap. Increase max_tokens or shorten the prompt."
+            )
+
         content = getattr(getattr(choices[0], "message", None), "content", None)
         if not isinstance(content, str):
             raise RuntimeError("OpenRouter response content is not text.")

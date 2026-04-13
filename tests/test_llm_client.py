@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from src.llm_client import OpenRouterLLMClient, _is_retryable_llm_error
+    from src.llm_client import LLMTokenLimitError, OpenRouterLLMClient, _is_retryable_llm_error
 except ImportError as exc:
     raise RuntimeError("Could not import project modules. Run from project root.") from exc
 
@@ -252,3 +252,53 @@ class TestExtractSQL:
         # API failure that must surface as an error, not be silently swallowed
         with pytest.raises(json.JSONDecodeError):
             OpenRouterLLMClient._extract_sql(text)
+
+
+# ---------------------------------------------------------------------------
+# Token limit (finish_reason == "length") handling
+# ---------------------------------------------------------------------------
+
+
+def _stub_response_with_finish_reason(finish_reason: str = "stop") -> MagicMock:
+    """Build a minimal SDK response with a configurable finish_reason."""
+    res = MagicMock()
+    res.usage = None
+    choice = MagicMock()
+    choice.message.content = "some content"
+    choice.finish_reason = finish_reason
+    res.choices = [choice]
+    return res
+
+
+class TestTokenLimitHandling:
+    def test_raises_llm_token_limit_error_when_finish_reason_is_length(self):
+        # WHY: a truncated response will fail JSON parsing downstream; raising a
+        # distinct error here gives a clear signal instead of a confusing parse error
+        client = _make_client()
+        client._client.chat.send = lambda **kw: _stub_response_with_finish_reason("length")
+        with pytest.raises(LLMTokenLimitError):
+            client._chat(messages=[{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=100)
+
+    def test_does_not_raise_when_finish_reason_is_stop(self):
+        client = _make_client()
+        client._client.chat.send = lambda **kw: _stub_response_with_finish_reason("stop")
+        result = client._chat(messages=[{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=100)
+        assert result == "some content"
+
+    def test_token_limit_error_is_not_retried(self):
+        # WHY: retrying with same params produces the same truncated output — wasteful
+        client = _make_client()
+        call_count = 0
+
+        def _length_response(**kw):
+            nonlocal call_count
+            call_count += 1
+            return _stub_response_with_finish_reason("length")
+
+        client._client.chat.send = _length_response
+        with pytest.raises(LLMTokenLimitError):
+            client._chat(messages=[{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=100)
+        assert call_count == 1  # no retries
+
+    def test_token_limit_error_is_not_retryable(self):
+        assert _is_retryable_llm_error(LLMTokenLimitError("token cap hit")) is False
