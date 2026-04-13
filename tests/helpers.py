@@ -1,19 +1,21 @@
 """Shared test utilities for pipeline integration tests.
 
-WHY: BaseLLMStub and _ZERO_STATS are imported explicitly by test modules,
-not auto-injected by pytest — they belong here, not in conftest.py.
+WHY: BaseLLMStub, _ZERO_STATS, and make_llm_client are imported explicitly by
+test modules, not auto-injected by pytest — they belong here, not in conftest.py.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 try:
+    from src.llm_client import OpenRouterLLMClient
     from src.types import (
         AnswerGenerationOutput,
         AnswerGroundingJudgeOutput,
@@ -30,6 +32,39 @@ _ZERO_STATS: dict[str, Any] = {
     "total_tokens": 0,
     "model": "stub",
 }
+
+
+def make_llm_client(
+    *,
+    timeout: int = 60,
+    max_retries: int = 3,
+    sql_max_tokens: int = 10000,
+    answer_max_tokens: int = 220,
+    judge_max_tokens: int = 20000,
+    sql_temperature: float = 0.0,
+    answer_temperature: float = 0.2,
+    answer_rows_sample: int = 30,
+) -> OpenRouterLLMClient:
+    """Build an OpenRouterLLMClient with a stubbed SDK, bypassing __init__.
+
+    WHY: __new__ is used so tests that only exercise specific methods (judges,
+    prompt builders) are not forced to construct a full PipelineConfig or hold
+    a real API key. All config-derived instance attributes are set explicitly
+    here so they match the defaults from PipelineConfig.
+    """
+    client = OpenRouterLLMClient.__new__(OpenRouterLLMClient)
+    client.model = "stub"
+    client._stats = dict(_ZERO_STATS)
+    client._client = MagicMock()
+    client._timeout = timeout
+    client._max_retries = max_retries
+    client._sql_max_tokens = sql_max_tokens
+    client._answer_max_tokens = answer_max_tokens
+    client._judge_max_tokens = judge_max_tokens
+    client._sql_temperature = sql_temperature
+    client._answer_temperature = answer_temperature
+    client._answer_rows_sample = answer_rows_sample
+    return client
 
 
 class BaseLLMStub:

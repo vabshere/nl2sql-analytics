@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
+    from helpers import make_llm_client
     from src.llm_client import LLMTokenLimitError, OpenRouterLLMClient, _is_retryable_llm_error
 except ImportError as exc:
     raise RuntimeError("Could not import project modules. Run from project root.") from exc
@@ -108,20 +109,14 @@ class TestBuildGroundingJudgeMessages:
 
 
 def _make_client(monkeypatch=None, timeout_seconds: int | None = None) -> OpenRouterLLMClient:
-    """Build a client with a stubbed OpenRouter dependency."""
+    """Thin wrapper around make_llm_client that honours timeout env overrides."""
+    import os
     if monkeypatch and timeout_seconds is not None:
         monkeypatch.setenv("LLM_TIMEOUT_SECONDS", str(timeout_seconds))
-    client = OpenRouterLLMClient.__new__(OpenRouterLLMClient)
-    client.model = "stub"
-    client._stats = {
-        "llm_calls": 0, "prompt_tokens": 0,
-        "completion_tokens": 0, "total_tokens": 0,
-    }
-    client._client = MagicMock()
-    import os
-    client._timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
-    client._max_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
-    return client
+    return make_llm_client(
+        timeout=int(os.getenv("LLM_TIMEOUT_SECONDS", "60")),
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "3")),
+    )
 
 
 # ---------------------------------------------------------------------------

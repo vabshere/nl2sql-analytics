@@ -12,15 +12,16 @@ from openrouter.components.chatformatjsonschemaconfig import (
     ChatFormatJSONSchemaConfig,
     ChatJSONSchemaConfig,
 )
+from openrouter import OpenRouter
 
 import json
-import os
 import time
 from typing import Any
 
 import structlog
 
 from jinja2 import Environment
+from src.config import PipelineConfig
 
 # WHY: shared env so all templates inherit the same whitespace settings;
 # trim_blocks removes the newline after a block tag,
@@ -188,21 +189,14 @@ def _is_retryable_llm_error(exc: Exception) -> bool:
     return any(token in msg for token in ("429", "500", "503", "rate limit", "overloaded"))
 
 
-DEFAULT_MODEL = "openai/gpt-5-nano"
-
-
 class OpenRouterLLMClient:
     """LLM client using the OpenRouter SDK for chat completions."""
 
     provider_name = "openrouter"
 
-    def __init__(self, api_key: str, model: str | None = None) -> None:
-        try:
-            from openrouter import OpenRouter
-        except ModuleNotFoundError as exc:
-            raise RuntimeError("Missing dependency: install 'openrouter'.") from exc
-        self.model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-        self._client = OpenRouter(api_key=api_key)
+    def __init__(self, config: PipelineConfig) -> None:
+        self.model = config.openrouter_model
+        self._client = OpenRouter(api_key=config.openrouter_api_key)
         self._stats = {
             "llm_calls": 0,
             "prompt_tokens": 0,
@@ -210,11 +204,19 @@ class OpenRouterLLMClient:
             "total_tokens": 0,
         }
         # WHY: LLM inference can take 5–30s; no timeout means a hung call blocks
-        # the pipeline indefinitely — default 60s is generous but bounded
-        self._timeout = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+        # the pipeline indefinitely
+        self._timeout = config.llm_timeout_seconds
         # WHY: configurable so callers can reduce retries in test/latency-sensitive
         # contexts without changing code
-        self._max_retries = int(os.getenv("LLM_MAX_RETRIES", "0"))
+        self._max_retries = config.llm_max_retries
+        # WHY: store generation params at init so every call site uses consistent
+        # values from config rather than scattered hardcoded literals
+        self._sql_max_tokens = config.sql_max_tokens
+        self._answer_max_tokens = config.answer_max_tokens
+        self._judge_max_tokens = config.judge_max_tokens
+        self._sql_temperature = config.sql_temperature
+        self._answer_temperature = config.answer_temperature
+        self._answer_rows_sample = config.answer_rows_sample
 
     def _chat(
         self,
@@ -238,13 +240,11 @@ class OpenRouterLLMClient:
             reraise=True,
         )
         def _send():
-            from openrouter.components import ChatRequestProvider
-
             return self._client.chat.send(
                 messages=messages,
                 model=self.model,
                 temperature=temperature,
-                max_tokens=50000,
+                max_tokens=max_tokens,
                 stream=False,
                 timeout_ms=self._timeout * 1000,
                 **kwargs,
@@ -274,8 +274,7 @@ class OpenRouterLLMClient:
         finish_reason = getattr(choices[0], "finish_reason", None)
         if finish_reason == "length":
             raise LLMTokenLimitError(
-                "LLM response truncated (finish_reason=length): "
-                "the model hit its token cap. Increase max_tokens or shorten the prompt."
+                "LLM response truncated (finish_reason=length): the model hit its token cap. Increase max_tokens or shorten the prompt."
             )
 
         content = getattr(getattr(choices[0], "message", None), "content", None)
@@ -323,11 +322,12 @@ class OpenRouterLLMClient:
         sql: str,
         rows: list[dict],
         correction_hint: str = "",
+        rows_sample: int = 30,
     ) -> list[dict]:
-        rows_sample = rows[:30]
+        rows_data = rows[:rows_sample]
         # WHY: columns listed separately so the model reasons about result shape
         # even when rows are sparse or contain null values
-        columns = list(rows_sample[0].keys()) if rows_sample else []
+        columns = list(rows_data[0].keys()) if rows_data else []
         return [
             {"role": "system", "content": _ANSWER_GEN_SYSTEM_TMPL.render()},
             {
@@ -336,7 +336,7 @@ class OpenRouterLLMClient:
                     question=question,
                     sql=sql,
                     columns=columns,
-                    rows=json.dumps(rows_sample, ensure_ascii=True),
+                    rows=json.dumps(rows_data, ensure_ascii=True),
                     count=len(rows),
                     correction_hint=correction_hint,
                 ),
@@ -391,8 +391,8 @@ class OpenRouterLLMClient:
         try:
             text = self._chat(
                 messages=self._build_sql_generation_messages(question, context),
-                temperature=0.0,
-                max_tokens=10000,
+                temperature=self._sql_temperature,
+                max_tokens=self._sql_max_tokens,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -443,7 +443,9 @@ class OpenRouterLLMClient:
         }
         return self.generate_sql(question, augmented)
 
-    def generate_answer(self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = "") -> AnswerGenerationOutput:
+    def generate_answer(
+        self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = ""
+    ) -> AnswerGenerationOutput:
         if not sql:
             return AnswerGenerationOutput(
                 answer="I cannot answer this with the available table and schema. Please rephrase using known survey fields.",
@@ -477,9 +479,11 @@ class OpenRouterLLMClient:
 
         try:
             answer = self._chat(
-                messages=self._build_answer_generation_messages(question, sql, rows, correction_hint=correction_hint),
-                temperature=0.2,
-                max_tokens=220,
+                messages=self._build_answer_generation_messages(
+                    question, sql, rows, correction_hint=correction_hint, rows_sample=self._answer_rows_sample
+                ),
+                temperature=self._answer_temperature,
+                max_tokens=self._answer_max_tokens,
             )
         except Exception as exc:
             logger.exception("Answer generation failed with an unexpected exception")
@@ -519,8 +523,8 @@ class OpenRouterLLMClient:
         try:
             text = self._chat(
                 messages=self._build_sql_judge_messages(question, sql, schema_context),
-                temperature=0.0,
-                max_tokens=20000,
+                temperature=self._sql_temperature,
+                max_tokens=self._judge_max_tokens,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -564,8 +568,8 @@ class OpenRouterLLMClient:
         try:
             text = self._chat(
                 messages=self._build_grounding_judge_messages(question, rows, answer),
-                temperature=0.0,
-                max_tokens=20000,
+                temperature=self._sql_temperature,
+                max_tokens=self._judge_max_tokens,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -602,8 +606,5 @@ class OpenRouterLLMClient:
         return out
 
 
-def build_default_llm_client() -> OpenRouterLLMClient:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required.")
-    return OpenRouterLLMClient(api_key=api_key)
+def build_default_llm_client(config: PipelineConfig) -> OpenRouterLLMClient:
+    return OpenRouterLLMClient(config=config)

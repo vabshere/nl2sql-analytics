@@ -40,7 +40,7 @@ SAMPLE_DESCRIPTIONS = {
 
 
 def test_load_descriptions(schema_description_db):
-    table_desc, col_descs = load_descriptions(schema_description_db)
+    table_desc, col_descs = load_descriptions(schema_description_db, TABLE_NAME)
     assert table_desc == "Gaming and Mental Health Behavioral Dataset"
     # WHY: mock DB has exactly 2 columns (age, gender)
     assert len(col_descs) == 2
@@ -90,7 +90,7 @@ def test_build_ddl_with_descriptions():
 
 
 def test_introspect_columns(analytics_db):
-    cols = introspect_columns(analytics_db)
+    cols = introspect_columns(analytics_db, TABLE_NAME)
     # WHY: mock DB has exactly 3 columns (age, gender, playtime_hours)
     assert len(cols) == 3
     for name, col_type in cols:
@@ -105,12 +105,11 @@ def test_introspect_columns(analytics_db):
 # ---------------------------------------------------------------------------
 
 
-def test_load_schema_context_default(analytics_db, schema_description_db, monkeypatch):
-    monkeypatch.delenv("SCHEMA_INCLUDE_DESCRIPTION", raising=False)
-    result = load_schema_context(analytics_db, schema_description_db)
+def test_load_schema_context_default(analytics_db, schema_description_db):
+    result = load_schema_context(analytics_db, schema_description_db, TABLE_NAME, include_description=True)
     assert {"ddl", "tables", "columns", "column_types"} <= set(result.keys())
     assert result["ddl"].strip().startswith(f"CREATE TABLE {TABLE_NAME}")
-    # default is include_description=True
+    # include_description=True → descriptions present
     assert "-- Age of the participant" in result["ddl"]
     # schema validation keys are populated
     assert TABLE_NAME in result["tables"]
@@ -119,17 +118,16 @@ def test_load_schema_context_default(analytics_db, schema_description_db, monkey
 
 
 @pytest.mark.parametrize(
-    "env_value,expected_in_ddl",
+    "include_description,expected_in_ddl",
     [
-        ("true", "-- Age of the participant"),
-        ("false", None),
+        (True, "-- Age of the participant"),
+        (False, None),
     ],
 )
-def test_load_schema_context_respects_schema_include_description_env(
-    analytics_db, schema_description_db, monkeypatch, env_value, expected_in_ddl
+def test_load_schema_context_include_description_param(
+    analytics_db, schema_description_db, include_description, expected_in_ddl
 ):
-    monkeypatch.setenv("SCHEMA_INCLUDE_DESCRIPTION", env_value)
-    result = load_schema_context(analytics_db, schema_description_db)
+    result = load_schema_context(analytics_db, schema_description_db, TABLE_NAME, include_description=include_description)
     if expected_in_ddl:
         assert expected_in_ddl in result["ddl"]
     else:
@@ -137,6 +135,6 @@ def test_load_schema_context_respects_schema_include_description_env(
 
 
 def test_load_schema_context_missing_metadata_db_still_works(analytics_db):
-    result = load_schema_context(analytics_db, MISSING_DB)
+    result = load_schema_context(analytics_db, MISSING_DB, TABLE_NAME, include_description=True)
     assert "ddl" in result
     assert "--" not in result["ddl"]

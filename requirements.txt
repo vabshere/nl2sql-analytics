@@ -1,5 +1,6 @@
 openrouter
 pandas
+pydantic-settings
 python-dotenv
 sqlglot
 structlog

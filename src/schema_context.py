@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from pathlib import Path
 
@@ -8,34 +7,10 @@ import structlog
 
 logger = structlog.get_logger()
 
-TABLE_NAME = "gaming_mental_health"
-
-
-def _parse_bool_env(key: str, default: bool) -> bool:
-    """Parse an env var as a boolean.
-
-    WHY: only "true"/"false" (case-insensitive) are accepted — any other value
-    is almost certainly a misconfiguration and should fail loudly rather than
-    being silently coerced into a truthy result. Empty string falls back to
-    the default so unset-but-declared vars in .env behave like absent vars.
-    """
-    value = os.getenv(key)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if not normalized:
-        return default
-    if normalized == "true":
-        return True
-    if normalized == "false":
-        return False
-    raise ValueError(
-        f"Invalid value for {key!r}: {value!r}. Acceptable values: true, false"
-    )
-
 
 def load_descriptions(
     metadata_db_path: Path,
+    table_name: str,
 ) -> tuple[str, dict[str, dict]]:
     """Read table and column descriptions from the metadata DB.
 
@@ -55,7 +30,7 @@ def load_descriptions(
 
         td_row = conn.execute(
             "SELECT description FROM table_descriptions WHERE table_name = ?",
-            (TABLE_NAME,),
+            (table_name,),
         ).fetchone()
         table_description = td_row["description"] if td_row else ""
 
@@ -67,7 +42,7 @@ def load_descriptions(
             JOIN table_descriptions td ON cd.table_description_id = td.id
             WHERE td.table_name = ?
             """,
-            (TABLE_NAME,),
+            (table_name,),
         ).fetchall()
     finally:
         conn.close()
@@ -83,15 +58,15 @@ def load_descriptions(
     return table_description, column_descriptions
 
 
-def introspect_columns(db_path: Path) -> list[tuple[str, str]]:
-    """Return (name, type) pairs for all columns in TABLE_NAME via PRAGMA.
+def introspect_columns(db_path: Path, table_name: str) -> list[tuple[str, str]]:
+    """Return (name, type) pairs for all columns in table_name via PRAGMA.
 
     WHY: preserves DB-declared order so callers can reason about determinism.
     """
     # WHY: explicit close — same reason as load_descriptions
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     finally:
         conn.close()
     # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
@@ -148,27 +123,22 @@ def build_ddl(
 def load_schema_context(
     db_path: Path,
     metadata_db_path: Path,
-    include_description: bool | None = None,
+    table_name: str,
+    include_description: bool,
 ) -> dict:
     """Orchestrate introspection + description loading + DDL building.
 
-    Returns {"ddl": "<CREATE TABLE ...>"}.
-
-    When include_description is None, reads SCHEMA_INCLUDE_DESCRIPTION env var
-    (default true).
+    Returns {"ddl": "<CREATE TABLE ...>", "tables": {...}, "columns": {...}, "column_types": {...}}.
 
     WHY: single-key dict keeps downstream f-string interpolation in generate_sql
     stable — adding future keys (e.g. row_count) does not break existing callers.
     """
-    if include_description is None:
-        include_description = _parse_bool_env("SCHEMA_INCLUDE_DESCRIPTION", default=True)
-
-    columns = introspect_columns(db_path)
-    table_description, column_descriptions = load_descriptions(metadata_db_path)
+    columns = introspect_columns(db_path, table_name)
+    table_description, column_descriptions = load_descriptions(metadata_db_path, table_name)
 
     ddl = build_ddl(
         columns=columns,
-        table_name=TABLE_NAME,
+        table_name=table_name,
         table_description=table_description,
         column_descriptions=column_descriptions,
         include_description=include_description,
@@ -182,7 +152,7 @@ def load_schema_context(
     column_types: dict[str, str] = {name: col_type for name, col_type in columns}
     return {
         "ddl": ddl,
-        "tables": {TABLE_NAME},
-        "columns": {TABLE_NAME: column_names},
-        "column_types": {TABLE_NAME: column_types},
+        "tables": {table_name},
+        "columns": {table_name: column_names},
+        "column_types": {table_name: column_types},
     }

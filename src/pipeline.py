@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
 import uuid
@@ -13,8 +12,9 @@ from sqlglot import exp
 from sqlglot.errors import ErrorLevel
 from sqlglot.optimizer.simplify import simplify
 
+from src.config import PipelineConfig
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
-from src.schema_context import _parse_bool_env, load_schema_context
+from src.schema_context import load_schema_context
 from src.types import (
     PipelineOutput,
     ResultValidationOutput,
@@ -27,9 +27,26 @@ from src.types import (
 logger = structlog.get_logger()
 
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = BASE_DIR / "data" / "gaming_mental_health.sqlite"
-DEFAULT_METADATA_DB_PATH = BASE_DIR / "data" / "schema_metadata.sqlite"
+def _config_from_kwargs(
+    config: PipelineConfig | None,
+    db_path: str | Path | None,
+    metadata_db_path: str | Path | None,
+) -> PipelineConfig:
+    """Resolve a PipelineConfig from explicit config or legacy path kwargs.
+
+    WHY: db_path / metadata_db_path kwargs exist for backwards compatibility with
+    callers that pre-date PipelineConfig (test_public.py, benchmark.py). When
+    supplied they are merged as field overrides so the rest of the config (model,
+    feature flags, timeouts, etc.) still comes from the environment.
+    """
+    if config is not None:
+        return config
+    overrides: dict = {}
+    if db_path is not None:
+        overrides["db_path"] = Path(db_path)
+    if metadata_db_path is not None:
+        overrides["metadata_db_path"] = Path(metadata_db_path)
+    return PipelineConfig(**overrides) if overrides else PipelineConfig()
 
 
 class SQLValidationError(Exception):
@@ -110,7 +127,7 @@ class SQLValidator:
 
 
 class SQLiteExecutor:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
 
     def run(self, sql: str | None) -> SQLExecutionOutput:
@@ -157,7 +174,7 @@ class SQLiteExecutor:
 
 class ResultValidator:
     @classmethod
-    def validate(cls, execution_output: SQLExecutionOutput) -> ResultValidationOutput:
+    def validate(cls, execution_output: SQLExecutionOutput, result_validation_enabled: bool = True) -> ResultValidationOutput:
         """Collect post-execution result shape signals.
 
         WHY: these are monitoring/observability flags only — never block the pipeline.
@@ -166,9 +183,8 @@ class ResultValidator:
         """
         start = time.perf_counter()
 
-        # WHY: honour env var to allow disabling result signals in environments
-        # where the checks add no value (e.g. benchmark runs that don't need them)
-        if not _parse_bool_env("RESULT_VALIDATION_ENABLED", default=True):
+        # WHY: caller passes the flag from config so this method has no env dependency
+        if not result_validation_enabled:
             return ResultValidationOutput(flags=[], timing_ms=0.0)
 
         # WHY: if execution itself errored, rows may be empty/partial for reasons
@@ -219,26 +235,35 @@ class ResultValidator:
 class AnalyticsPipeline:
     def __init__(
         self,
-        db_path: str | Path = DEFAULT_DB_PATH,
+        config: PipelineConfig | None = None,
         llm_client: OpenRouterLLMClient | None = None,
-        metadata_db_path: str | Path = DEFAULT_METADATA_DB_PATH,
+        *,
+        db_path: str | Path | None = None,
+        metadata_db_path: str | Path | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
-        self.llm = llm_client or build_default_llm_client()
-        self.executor = SQLiteExecutor(self.db_path)
+        # WHY: llm_client is kept as a separate param for test stub injection —
+        # it is dependency injection, not configuration
+        self._config = _config_from_kwargs(config, db_path, metadata_db_path)
+        self.llm = llm_client or build_default_llm_client(self._config)
+        self.executor = SQLiteExecutor(self._config.db_path)
         # WHY: build once at init — schema is static, no per-request DB roundtrip
         try:
-            self._schema_context = load_schema_context(self.db_path, Path(metadata_db_path))
+            self._schema_context = load_schema_context(
+                self._config.db_path,
+                self._config.metadata_db_path,
+                self._config.table_name,
+                self._config.schema_include_description,
+            )
         except sqlite3.OperationalError:
             logger.exception(
                 "Could not introspect schema — generate_sql will receive empty context",
-                db_path=str(self.db_path),
+                db_path=str(self._config.db_path),
             )
             self._schema_context = {}
         except Exception:
             logger.exception(
                 "Unexpected error building schema context — generate_sql will receive empty context",
-                db_path=str(self.db_path),
+                db_path=str(self._config.db_path),
             )
             self._schema_context = {}
 
@@ -265,7 +290,7 @@ class AnalyticsPipeline:
             return validation_output, candidate_sql, SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0), None
         # WHY: judge is opt-in and non-blocking; stats appended to sink for aggregation
         judge_verdict: SQLAnalyticsJudgeOutput | None = None
-        if _parse_bool_env("SQL_ANALYTICS_JUDGE_ENABLED", default=False):
+        if self._config.sql_analytics_judge_enabled:
             judge_verdict = self.llm.judge_sql_analytics(question, candidate_sql, self._schema_context)
             sql_gen_output.intermediate_outputs.append(judge_verdict.model_dump())
             stats_sink.append(judge_verdict.llm_stats)
@@ -306,7 +331,7 @@ class AnalyticsPipeline:
 
         # Stage 3b: Result shape signals (informational — never blocks)
         structlog.contextvars.bind_contextvars(stage="result_validation")
-        result_validation_output = ResultValidator.validate(execution_output)
+        result_validation_output = ResultValidator.validate(execution_output, self._config.result_validation_enabled)
 
         # Unified SQL correction loop (opt-in per trigger type)
         # WHY: single loop handles all three correction triggers — each counter tracks
@@ -316,26 +341,26 @@ class AnalyticsPipeline:
         execution_correction_attempts = 0
         analytics_correction_attempts = 0
         result_validation_correction_attempts = 0
-        max_execution_retries = int(os.getenv("MAX_SQL_CORRECTION_RETRIES", "3"))
-        max_analytics_retries = int(os.getenv("MAX_SQL_ANALYTICS_CORRECTION_RETRIES", "3"))
-        max_result_validation_retries = int(os.getenv("MAX_RESULT_VALIDATION_CORRECTION_RETRIES", "3"))
+        max_execution_retries = self._config.max_sql_correction_retries
+        max_analytics_retries = self._config.max_sql_analytics_correction_retries
+        max_result_validation_retries = self._config.max_result_validation_correction_retries
         correction_history: list[dict] = []
 
         while sql is not None:
             execution_should_correct = (
-                _parse_bool_env("SQL_CORRECTION_ENABLED", default=False)
+                self._config.sql_correction_enabled
                 and (not validation_output.is_valid or execution_output.error is not None)
                 and execution_correction_attempts < max_execution_retries
             )
             analytics_should_correct = (
-                _parse_bool_env("SQL_ANALYTICS_JUDGE_CORRECTION_ENABLED", default=False)
+                self._config.sql_analytics_judge_correction_enabled
                 and current_judge_verdict is not None
                 and not current_judge_verdict.verdict
                 and not execution_output.error
                 and analytics_correction_attempts < max_analytics_retries
             )
             result_should_correct = (
-                _parse_bool_env("RESULT_VALIDATION_CORRECTION_ENABLED", default=False)
+                self._config.result_validation_correction_enabled
                 and validation_output.is_valid  # WHY: result signals are only meaningful after a successful execution
                 and bool(result_validation_output.flags)
                 and not execution_output.error
@@ -413,12 +438,12 @@ class AnalyticsPipeline:
             execution_output = corrected_execution
             rows = execution_output.rows
             current_judge_verdict = corrected_verdict
-            result_validation_output = ResultValidator.validate(execution_output)
+            result_validation_output = ResultValidator.validate(execution_output, self._config.result_validation_enabled)
 
         # WHY: warn only when budget ran out AND the problem still persists —
         # a correction that succeeded within budget is not a warning
         if (
-            _parse_bool_env("SQL_CORRECTION_ENABLED", default=False)
+            self._config.sql_correction_enabled
             and execution_correction_attempts >= max_execution_retries
             and (not validation_output.is_valid or execution_output.error is not None)
         ):
@@ -429,7 +454,7 @@ class AnalyticsPipeline:
                 max=max_execution_retries,
             )
         if (
-            _parse_bool_env("SQL_ANALYTICS_JUDGE_CORRECTION_ENABLED", default=False)
+            self._config.sql_analytics_judge_correction_enabled
             and analytics_correction_attempts >= max_analytics_retries
             and current_judge_verdict is not None
             and not current_judge_verdict.verdict
@@ -441,7 +466,7 @@ class AnalyticsPipeline:
                 max=max_analytics_retries,
             )
         if (
-            _parse_bool_env("RESULT_VALIDATION_CORRECTION_ENABLED", default=False)
+            self._config.result_validation_correction_enabled
             and result_validation_correction_attempts >= max_result_validation_retries
             and bool(result_validation_output.flags)
         ):
@@ -460,17 +485,17 @@ class AnalyticsPipeline:
         # WHY: skip when sql or rows are absent — the fallback answer paths have
         # no substantive data to verify against, making grounding checks meaningless
         answer_judge_llm_stats: dict = {}
-        if _parse_bool_env("ANSWER_GROUNDING_JUDGE_ENABLED", default=False) and sql is not None and rows:
+        if self._config.answer_grounding_judge_enabled and sql is not None and rows:
             grounding_verdict = self.llm.judge_answer_grounding(question, sql, rows, answer_output.answer)
             answer_judge_llm_stats = grounding_verdict.llm_stats
             answer_output.intermediate_outputs.append(grounding_verdict.model_dump())
 
             answer_grounding_correction_attempts = 0
-            max_answer_grounding_retries = int(os.getenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "3"))
+            max_answer_grounding_retries = self._config.max_answer_grounding_correction_retries
             # WHY: re-generate answer with same sql+rows — grounding failures are answer
             # phrasing issues, not data retrieval issues; no SQL re-generation needed
             while (
-                _parse_bool_env("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", default=False)
+                self._config.answer_grounding_judge_correction_enabled
                 and not grounding_verdict.verdict
                 and answer_grounding_correction_attempts < max_answer_grounding_retries
             ):

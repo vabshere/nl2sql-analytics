@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     from helpers import BaseLLMStub
+    from src.config import PipelineConfig
     from src.pipeline import AnalyticsPipeline
     from src.types import AnswerGenerationOutput, SQLGenerationOutput
 except ImportError as exc:
@@ -59,9 +60,9 @@ class _CapturingLLM:
         return dict(_ZERO_LLM_STATS)
 
 
-def test_pipeline_passes_ddl_context_to_generate_sql(analytics_db, schema_description_db):
+def test_pipeline_passes_ddl_context_to_generate_sql(pipeline_config, analytics_db, schema_description_db):
     llm = _CapturingLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=pipeline_config, llm_client=llm)
     pipeline.run("anything")
     assert len(llm.received_contexts) == 1
     ctx = llm.received_contexts[0]
@@ -69,10 +70,10 @@ def test_pipeline_passes_ddl_context_to_generate_sql(analytics_db, schema_descri
     assert ctx["ddl"].strip().startswith("CREATE TABLE gaming_mental_health")
 
 
-def test_pipeline_context_built_once_and_reused(analytics_db, schema_description_db):
+def test_pipeline_context_built_once_and_reused(pipeline_config, analytics_db, schema_description_db):
     """Same context object must be reused across runs — built once in __init__."""
     llm = _CapturingLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=pipeline_config, llm_client=llm)
     pipeline.run("question one")
     pipeline.run("question two")
     pipeline.run("question three")
@@ -87,9 +88,16 @@ def test_pipeline_context_built_once_and_reused(analytics_db, schema_description
 def test_pipeline_context_respects_schema_include_description_env(
     analytics_db, schema_description_db, monkeypatch, env_value, expected_in_ddl
 ):
+    # WHY: monkeypatch before constructing PipelineConfig — pydantic-settings
+    # reads env vars at construction time, so the patch must precede the config
     monkeypatch.setenv("SCHEMA_INCLUDE_DESCRIPTION", env_value)
     llm = _CapturingLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(
+        openrouter_api_key="test-key",
+        db_path=analytics_db,
+        metadata_db_path=schema_description_db,
+    )
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     pipeline.run("anything")
     ddl = llm.received_contexts[0]["ddl"]
     if expected_in_ddl:

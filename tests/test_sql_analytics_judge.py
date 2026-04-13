@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,7 +12,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from helpers import BaseLLMStub, _ZERO_STATS
+    from helpers import BaseLLMStub, _ZERO_STATS, make_llm_client
+    from src.config import PipelineConfig
     from src.llm_client import OpenRouterLLMClient
     from src.pipeline import AnalyticsPipeline
     from src.types import SQLAnalyticsJudgeOutput, SQLGenerationOutput
@@ -42,14 +43,6 @@ _INCORRECT_LLM_RESPONSE = {
 }
 
 
-def _make_client() -> OpenRouterLLMClient:
-    client = OpenRouterLLMClient.__new__(OpenRouterLLMClient)
-    client.model = "stub"
-    client._stats = dict(_ZERO_STATS)
-    client._client = MagicMock()
-    return client
-
-
 # ---------------------------------------------------------------------------
 # judge_sql_analytics — unit tests on the method itself
 # ---------------------------------------------------------------------------
@@ -77,7 +70,7 @@ def _make_client() -> OpenRouterLLMClient:
     ],
 )
 def test_judge_sql_analytics(chat_kwargs, sql, expected):
-    client = _make_client()
+    client = make_llm_client()
     with patch.object(client, "_chat", **chat_kwargs) as mock_chat:
         verdict = client.judge_sql_analytics(
             question="What is the average playtime by gender?",
@@ -128,7 +121,8 @@ class _StubLLM(BaseLLMStub):
 def test_judge_appended_to_intermediate_outputs_when_enabled(analytics_db, schema_description_db, monkeypatch):
     monkeypatch.setenv("SQL_ANALYTICS_JUDGE_ENABLED", "true")
     llm = _StubLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("What is the average playtime by gender?")
     assert any(d.get("stage") == "sql_analytics_judge" for d in output.sql_generation.intermediate_outputs)
 
@@ -136,7 +130,8 @@ def test_judge_appended_to_intermediate_outputs_when_enabled(analytics_db, schem
 def test_judge_skipped_when_disabled(analytics_db, schema_description_db, monkeypatch):
     monkeypatch.setenv("SQL_ANALYTICS_JUDGE_ENABLED", "false")
     llm = _StubLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("any question")
     assert not any(d.get("stage") == "sql_analytics_judge" for d in output.sql_generation.intermediate_outputs)
     assert llm.judge_calls == []
@@ -163,6 +158,7 @@ def test_judge_skipped_when_no_valid_sql(analytics_db, schema_description_db, mo
             )
 
     llm = _LLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     pipeline.run("any question")
     assert llm.judge_calls == []

@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     from helpers import BaseLLMStub, _ZERO_STATS
+    from src.config import PipelineConfig
     from src.pipeline import AnalyticsPipeline
     from src.types import (
         AnswerGenerationOutput,
@@ -41,7 +42,8 @@ def _zero_stats() -> dict[str, Any]:
 
 
 def _make_pipeline(llm, db, metadata_db) -> AnalyticsPipeline:
-    return AnalyticsPipeline(db_path=db, llm_client=llm, metadata_db_path=metadata_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=db, metadata_db_path=metadata_db)
+    return AnalyticsPipeline(config=cfg, llm_client=llm)
 
 
 # ---------------------------------------------------------------------------

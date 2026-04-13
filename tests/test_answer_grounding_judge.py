@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -12,7 +12,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from helpers import BaseLLMStub, _ZERO_STATS
+    from helpers import BaseLLMStub, _ZERO_STATS, make_llm_client
+    from src.config import PipelineConfig
     from src.llm_client import OpenRouterLLMClient
     from src.pipeline import AnalyticsPipeline
     from src.types import AnswerGroundingJudgeOutput, SQLGenerationOutput
@@ -39,14 +40,6 @@ _SAMPLE_SQL = "SELECT gender, AVG(playtime_hours) AS avg_playtime FROM gaming_me
 _SAMPLE_ANSWER = "Males average 12.5 hours of playtime; Females average 10.2 hours."
 
 
-def _make_client() -> OpenRouterLLMClient:
-    client = OpenRouterLLMClient.__new__(OpenRouterLLMClient)
-    client.model = "stub"
-    client._stats = dict(_ZERO_STATS)
-    client._client = MagicMock()
-    return client
-
-
 # ---------------------------------------------------------------------------
 # judge_answer_grounding — unit tests on the method itself
 # ---------------------------------------------------------------------------
@@ -70,7 +63,7 @@ def _make_client() -> OpenRouterLLMClient:
     ],
 )
 def test_judge_answer_grounding(chat_kwargs, answer, expected):
-    client = _make_client()
+    client = make_llm_client()
     with patch.object(client, "_chat", **chat_kwargs) as mock_chat:
         verdict = client.judge_answer_grounding(
             question="What is the average playtime by gender?",
@@ -120,11 +113,8 @@ def test_judge_appended_to_intermediate_outputs_when_enabled(analytics_db_with_d
     # WHY: use a DB with rows — judge is skipped when rows == [] (tested separately)
     monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_ENABLED", "true")
     llm = _StubLLM()
-    pipeline = AnalyticsPipeline(
-        db_path=analytics_db_with_data,
-        llm_client=llm,
-        metadata_db_path=schema_description_db,
-    )
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db_with_data, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("What is the average playtime by gender?")
     assert any(d.get("stage") == "answer_grounding_judge" for d in output.answer_generation.intermediate_outputs)
 
@@ -132,7 +122,8 @@ def test_judge_appended_to_intermediate_outputs_when_enabled(analytics_db_with_d
 def test_judge_skipped_when_disabled(analytics_db, schema_description_db, monkeypatch):
     monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_ENABLED", "false")
     llm = _StubLLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("any question")
     assert not any(d.get("stage") == "answer_grounding_judge" for d in output.answer_generation.intermediate_outputs)
     assert llm.grounding_calls == []
@@ -165,7 +156,8 @@ def test_judge_skipped_when_no_data(analytics_db, schema_description_db, monkeyp
             )
 
     llm = _LLM()
-    pipeline = AnalyticsPipeline(db_path=analytics_db, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     pipeline.run("any question")
     assert llm.grounding_calls == []
 
@@ -210,7 +202,8 @@ def test_answer_grounding_correction_triggered_on_fail(analytics_db_with_data, s
     monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", "true")
     monkeypatch.setenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "1")
     llm = _LLMGroundingAlwaysFail()
-    pipeline = AnalyticsPipeline(db_path=analytics_db_with_data, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db_with_data, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("What is the average playtime by gender?")
     assert llm.generate_answer_calls > 1
     assert any(d.get("stage") == "answer_grounding_correction" for d in output.answer_generation.intermediate_outputs)
@@ -222,7 +215,8 @@ def test_answer_grounding_correction_bounded_by_max_retries(analytics_db_with_da
     monkeypatch.setenv("ANSWER_GROUNDING_JUDGE_CORRECTION_ENABLED", "true")
     monkeypatch.setenv("MAX_ANSWER_GROUNDING_CORRECTION_RETRIES", "2")
     llm = _LLMGroundingAlwaysFail()
-    pipeline = AnalyticsPipeline(db_path=analytics_db_with_data, llm_client=llm, metadata_db_path=schema_description_db)
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db_with_data, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=llm)
     output = pipeline.run("What is the average playtime by gender?")
     correction_entries = [d for d in output.answer_generation.intermediate_outputs if d.get("stage") == "answer_grounding_correction"]
     assert len(correction_entries) == 2

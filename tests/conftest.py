@@ -11,6 +11,11 @@ from dotenv import load_dotenv
 # already loaded by a previous import
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.test", override=True)
 
+try:
+    from src.config import PipelineConfig
+except ImportError as exc:
+    raise RuntimeError("Could not import project modules. Run from project root.") from exc
+
 
 @pytest.fixture
 def analytics_db(tmp_path: Path) -> Path:
@@ -124,3 +129,13 @@ def schema_description_db(tmp_path: Path) -> Path:
     conn.commit()
     conn.close()
     return db
+
+
+@pytest.fixture
+def pipeline_config(analytics_db: Path, schema_description_db: Path) -> PipelineConfig:
+    """Minimal PipelineConfig wired to test DBs, no real API key needed."""
+    return PipelineConfig(
+        openrouter_api_key="test-key",
+        db_path=analytics_db,
+        metadata_db_path=schema_description_db,
+    )

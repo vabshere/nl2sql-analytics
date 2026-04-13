@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     from helpers import BaseLLMStub, _ZERO_STATS
+    from src.config import PipelineConfig
     from src.pipeline import AnalyticsPipeline, ResultValidator, SQLiteExecutor
     from src.types import ResultValidationOutput, SQLExecutionOutput
 except ImportError as exc:
@@ -73,15 +74,14 @@ def test_execution_error_skips_checks():
 
 
 @pytest.mark.parametrize(
-    "env_val,expect_flag",
+    "enabled,expect_flag",
     [
-        ("false", False),
-        ("true", True),
+        (False, False),
+        (True, True),
     ],
 )
-def test_env_var_gate(monkeypatch, env_val, expect_flag):
-    monkeypatch.setenv("RESULT_VALIDATION_ENABLED", env_val)
-    result = ResultValidator.validate(_exec(rows=[{"age": None}]))
+def test_env_var_gate(enabled, expect_flag):
+    result = ResultValidator.validate(_exec(rows=[{"age": None}]), result_validation_enabled=enabled)
     if expect_flag:
         assert "all_null_column:age" in result.flags
     else:
@@ -127,11 +127,8 @@ def test_exactly_100_rows_no_truncation(analytics_db_100_rows):
 
 
 def test_pipeline_wires_result_validation(analytics_db, schema_description_db):
-    pipeline = AnalyticsPipeline(
-        db_path=analytics_db,
-        llm_client=_StubLLM(),
-        metadata_db_path=schema_description_db,
-    )
+    cfg = PipelineConfig(openrouter_api_key="test-key", db_path=analytics_db, metadata_db_path=schema_description_db)
+    pipeline = AnalyticsPipeline(config=cfg, llm_client=_StubLLM())
     output = pipeline.run("any question")
     assert hasattr(output, "result_validation")
     assert isinstance(output.result_validation, ResultValidationOutput)
