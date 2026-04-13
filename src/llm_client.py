@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from src.types import (
     AnswerGenerationOutput,
     AnswerGroundingJudgeOutput,
@@ -18,7 +19,141 @@ import os
 import time
 from typing import Any
 
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from jinja2 import Environment
+
+# WHY: shared env so all templates inherit the same whitespace settings;
+# trim_blocks removes the newline after a block tag,
+# lstrip_blocks strips leading whitespace before block tags —
+# together they produce clean output without manual {%- -%} stripping
+_JINJA_ENV = Environment(trim_blocks=True, lstrip_blocks=True)
+
+# ── SQL Generation ────────────────────────────────────────────────────────────
+
+_SQL_GEN_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are an expert analytics SQL generator.
+Your task is to convert a user question into correct SQLite SQL for a SINGLE TABLE database.
+
+Rules:
+* Output ONLY valid SQL
+* Use SQLite syntax
+* Use ONLY the provided table and columns — never invent columns
+* Prefer explicit column names over SELECT *
+* Use WHERE filters when implied
+* Use GROUP BY only when needed
+* Use ORDER BY only when useful
+* Use LIMIT when returning individual rows
+* SQLite date functions only: date(), datetime(), strftime()
+* Never use ILIKE (not supported in SQLite)
+* Handle NULL safely when relevant
+* Read-only SQL only
+* If the user's intent is to modify, delete, update, or insert data, output null for sql — do not rephrase as a SELECT
+* If the question cannot be answered from the available schema and columns, output null for sql\
+""")
+
+_SQL_GEN_USER_TMPL = _JINJA_ENV.from_string("""\
+{% if ddl %}
+SCHEMA:
+{{ ddl }}
+
+{% endif %}
+{% if table_name %}
+TABLE:
+{{ table_name }}
+
+{% endif %}
+USER QUESTION:
+{{ question }}
+{% if correction_hint %}
+
+CORRECTION CONTEXT:
+{{ correction_hint }}
+{% endif %}\
+""")
+
+# ── Answer Generation ─────────────────────────────────────────────────────────
+
+_ANSWER_GEN_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are a data analyst assistant.
+Answer the user's question using ONLY the SQL query results.
+
+Rules:
+* Use ONLY provided rows
+* Never invent facts
+* Use exact values from the data
+* Explain trends only if visible in the rows
+* If result is partial or limited, say so
+* Write for a business user
+* Be concise\
+""")
+
+_ANSWER_GEN_USER_TMPL = _JINJA_ENV.from_string("""\
+USER QUESTION:
+{{ question }}
+
+SQL:
+{{ sql }}
+{% if columns %}
+
+COLUMNS:
+{{ columns }}
+{% endif %}
+
+ROWS:
+{{ rows }}
+
+ROW COUNT:
+{{ count }}\
+""")
+
+# ── SQL Analytics Judge ───────────────────────────────────────────────────────
+
+_SQL_JUDGE_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are a SQL quality reviewer for a SQLite analytics database.
+Evaluate whether the SQL correctly answers the user request.
+
+Rubric:
+fail: wrong columns, wrong filters, wrong aggregation, non-executable SQL, columns not in schema, non-SELECT statement
+borderline: mostly correct but incomplete, minor logic issue, missing filter, unnecessary columns selected
+pass: correct, uses valid schema, appropriate logic, SELECT only, directly answers the question
+
+Check: intent match, column validity, filter correctness, aggregation correctness, SQLite syntax\
+""")
+
+_SQL_JUDGE_USER_TMPL = _JINJA_ENV.from_string("""\
+{% if ddl %}
+SCHEMA:
+{{ ddl }}
+
+{% endif %}
+QUESTION:
+{{ question }}
+
+SQL:
+{{ sql }}\
+""")
+
+# ── Answer Grounding Judge ────────────────────────────────────────────────────
+
+_GROUNDING_JUDGE_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are a strict evaluator of answers generated from SQL results.
+
+Rubric:
+fail: contradicts rows, wrong numbers, hallucinated claims, does not answer question
+borderline: mostly correct but incomplete, unclear wording, misses an important detail
+pass: correct, grounded in rows, clear, useful, answers question\
+""")
+
+_GROUNDING_JUDGE_USER_TMPL = _JINJA_ENV.from_string("""\
+QUESTION:
+{{ question }}
+
+ROWS:
+{{ rows }}
+
+ANSWER:
+{{ answer }}\
+""")
+
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +219,8 @@ class OpenRouterLLMClient:
             reraise=True,
         )
         def _send():
+            from openrouter.components import ChatRequestProvider
+
             return self._client.chat.send(
                 messages=messages,
                 model=self.model,
@@ -125,24 +262,102 @@ class OpenRouterLLMClient:
             return sql.strip()
         return None
 
-    def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
-        system_prompt = (
-            "You are a SQL assistant. "
-            "Generate SQLite SELECT queries from natural language questions. "
-            "Return your response in a format that can be parsed to extract the SQL."
-        )
-        user_prompt = f"Context: {context}\n\nQuestion: {question}\n\nGenerate a SQL query to answer this question."
+    # ── Prompt builders ───────────────────────────────────────────────────────
+    # WHY: static methods keep prompt construction pure and testable without
+    # needing an LLM client instance or mocking any HTTP calls
 
+    @staticmethod
+    def _build_sql_generation_messages(question: str, context: dict) -> list[dict]:
+        # WHY: only ddl/table_name go to the LLM — columns/column_types are for
+        # rule-based validation only and add noise to the prompt.
+        # table_name derived from existing tables set — no new context key needed.
+        tables = context.get("tables", set())
+        table_name = next(iter(tables), "")
+        return [
+            {"role": "system", "content": _SQL_GEN_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _SQL_GEN_USER_TMPL.render(
+                    ddl=context.get("ddl", ""),
+                    table_name=table_name,
+                    question=question,
+                    correction_hint=context.get("correction_hint", ""),
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _build_answer_generation_messages(
+        question: str,
+        sql: str,
+        rows: list[dict],
+    ) -> list[dict]:
+        rows_sample = rows[:30]
+        # WHY: columns listed separately so the model reasons about result shape
+        # even when rows are sparse or contain null values
+        columns = list(rows_sample[0].keys()) if rows_sample else []
+        return [
+            {"role": "system", "content": _ANSWER_GEN_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _ANSWER_GEN_USER_TMPL.render(
+                    question=question,
+                    sql=sql,
+                    columns=columns,
+                    rows=json.dumps(rows_sample, ensure_ascii=True),
+                    count=len(rows),
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _build_sql_judge_messages(
+        question: str,
+        sql: str,
+        schema_context: dict,
+    ) -> list[dict]:
+        return [
+            {"role": "system", "content": _SQL_JUDGE_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _SQL_JUDGE_USER_TMPL.render(
+                    ddl=schema_context.get("ddl", ""),
+                    question=question,
+                    sql=sql,
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _build_grounding_judge_messages(
+        question: str,
+        rows: list[dict],
+        answer: str,
+    ) -> list[dict]:
+        # WHY: SQL intentionally excluded — grounding judge verifies answer vs
+        # rows only; including SQL risks evaluating SQL correctness instead.
+        # No row cap — the judge needs the full result set to accurately detect
+        # hallucinated values or missing data.
+        return [
+            {"role": "system", "content": _GROUNDING_JUDGE_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _GROUNDING_JUDGE_USER_TMPL.render(
+                    question=question,
+                    rows=json.dumps(rows, ensure_ascii=True),
+                    answer=answer,
+                ),
+            },
+        ]
+
+    def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
         start = time.perf_counter()
         error = None
         sql = None
 
         try:
             text = self._chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=self._build_sql_generation_messages(question, context),
                 temperature=0.0,
                 max_tokens=10000,
                 response_format=ChatFormatJSONSchemaConfig(
@@ -216,23 +431,13 @@ class OpenRouterLLMClient:
                 error=None,
             )
 
-        system_prompt = "You are a concise analytics assistant. Use only the provided SQL results. Do not invent data."
-        user_prompt = (
-            f"Question:\n{question}\n\nSQL:\n{sql}\n\n"
-            f"Rows (JSON):\n{json.dumps(rows[:30], ensure_ascii=True)}\n\n"
-            "Write a concise answer in plain English."
-        )
-
         start = time.perf_counter()
         error = None
         answer = ""
 
         try:
             answer = self._chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=self._build_answer_generation_messages(question, sql, rows),
                 temperature=0.2,
                 max_tokens=220,
             )
@@ -265,24 +470,9 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to SQLGenerationOutput.intermediate_outputs.
         """
-        system_prompt = (
-            "You are an expert analytics SQL reviewer. "
-            "Evaluate whether a SQL query correctly implements the analytical intent "
-            "of a natural language question. "
-            "Consider: (1) aggregation — does the query aggregate when the question "
-            "asks for a summary (average, count, total)? (2) grouping — does GROUP BY "
-            "match the breakdown dimension in the question? (3) filtering — is the "
-            "WHERE clause consistent with the question's scope? (4) granularity — "
-            "does the result shape match what the question expects?"
-        )
-        user_prompt = f"Question: {question}\n\nSQL:\n{sql}\n\nSchema:\n{schema_context.get('ddl', '')}"
-
         try:
             text = self._chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=self._build_sql_judge_messages(question, sql, schema_context),
                 temperature=0.0,
                 max_tokens=20000,
                 response_format=ChatFormatJSONSchemaConfig(
@@ -325,22 +515,9 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to AnswerGenerationOutput.intermediate_outputs.
         """
-        system_prompt = (
-            "You are an answer quality auditor for a data analytics system. "
-            "Verify that the answer is grounded in the provided data rows — "
-            "it should not state values, entities, or conclusions not present in the rows."
-        )
-        # WHY: include only result rows (not full schema) — Arize AI research shows
-        # judge performance improves when limited to data actually in scope
-        rows_sample = json.dumps(rows[:30], ensure_ascii=True)
-        user_prompt = f"Question: {question}\n\nSQL:\n{sql}\n\nData rows (up to 10):\n{rows_sample}\n\nAnswer to verify:\n{answer}"
-
         try:
             text = self._chat(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=self._build_grounding_judge_messages(question, rows, answer),
                 temperature=0.0,
                 max_tokens=20000,
                 response_format=ChatFormatJSONSchemaConfig(

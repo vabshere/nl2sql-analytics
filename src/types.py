@@ -26,8 +26,7 @@ class JudgeResponse(BaseModel):
     )
 
     issues: list[str] = Field(
-        default_factory=list,
-        description="Specific problems found; empty if none."
+        description="Specific problems found; empty list if none."
     )
 
     reason: str = Field(

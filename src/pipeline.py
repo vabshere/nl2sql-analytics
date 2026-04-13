@@ -263,6 +263,7 @@ class AnalyticsPipeline:
             sql_gen_output.intermediate_outputs.append(judge_verdict.model_dump())
             stats_sink.append(judge_verdict.llm_stats)
         execution_output = self.executor.run(candidate_sql)
+        l = len(execution_output.rows) if len(execution_output.rows) <= 3 else 3
         return validation_output, candidate_sql, execution_output, judge_verdict
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
@@ -329,7 +330,7 @@ class AnalyticsPipeline:
                 stage_name = "sql_correction"
             elif analytics_should_correct:
                 analytics_correction_attempts += 1
-                issues_hint = "; ".join(current_judge_verdict.issues) if current_judge_verdict.issues else current_judge_verdict.reason
+                issues_hint = current_judge_verdict.reason
                 current_hint = f"Analytics judge flagged the SQL as '{current_judge_verdict.grade}'. Issues: {issues_hint}"
                 stage_name = "sql_analytics_correction"
             else:
