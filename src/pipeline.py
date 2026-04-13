@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import logging
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
+
+import structlog
 
 import sqlglot
 from sqlglot import exp
@@ -22,7 +24,7 @@ from src.types import (
     SQLValidationOutput,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -91,8 +93,13 @@ class SQLValidator:
             # WHY: simplify() removes the WHERE entirely when the condition is a
             # tautology; checking original-has-WHERE vs simplified-has-none
             # catches non-obvious forms like 1+0=1 or 'x' LIKE 'x' too
-            if stmt.find(exp.Where) and not simplify(stmt).find(exp.Where):
-                return _invalid("WHERE clause is always true.")
+            if stmt.find(exp.Where):
+                try:
+                    simplified = simplify(stmt)
+                except Exception as exc:
+                    return _invalid(f"WHERE clause simplification failed: {exc}")
+                if not simplified.find(exp.Where):
+                    return _invalid("WHERE clause is always true.")
 
         return SQLValidationOutput(
             is_valid=True,
@@ -134,6 +141,7 @@ class SQLiteExecutor:
                 if row_count == 100:
                     rows_truncated = cur.fetchone() is not None
         except Exception as exc:
+            logger.exception("SQL execution failed with an unexpected exception")
             error = str(exc)
             rows = []
             row_count = 0
@@ -221,17 +229,16 @@ class AnalyticsPipeline:
         # WHY: build once at init — schema is static, no per-request DB roundtrip
         try:
             self._schema_context = load_schema_context(self.db_path, Path(metadata_db_path))
-        except sqlite3.OperationalError as exc:
-            logger.warning(
-                "Could not introspect schema from %s (%s) — generate_sql will receive empty context.",
-                self.db_path,
-                exc,
+        except sqlite3.OperationalError:
+            logger.exception(
+                "Could not introspect schema — generate_sql will receive empty context",
+                db_path=str(self.db_path),
             )
             self._schema_context = {}
-        except Exception as exc:
-            logger.error(
-                "Unexpected error building schema context: %s — generate_sql will receive empty context.",
-                exc,
+        except Exception:
+            logger.exception(
+                "Unexpected error building schema context — generate_sql will receive empty context",
+                db_path=str(self.db_path),
             )
             self._schema_context = {}
 
@@ -266,15 +273,31 @@ class AnalyticsPipeline:
         return validation_output, candidate_sql, execution_output, judge_verdict
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
+        """Public entry point. Owns context lifecycle; delegates logic to _run_impl."""
+        # WHY: clear first so a previous run's context does not bleed into this one
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            pipeline_run_id=str(uuid.uuid4()),
+            model=self.llm.model,
+            **({"request_id": request_id} if request_id is not None else {}),
+        )
+        try:
+            return self._run_impl(question, request_id)
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+    def _run_impl(self, question: str, request_id: str | None) -> PipelineOutput:
         start = time.perf_counter()
 
         # Stage 1: SQL Generation
+        structlog.contextvars.bind_contextvars(stage="sql_generation")
         sql_gen_output = self.llm.generate_sql(question, self._schema_context)
         sql = sql_gen_output.sql
 
         # Stages 2 / 2b / 3: validate → judge (opt-in) → execute
         # WHY: _validate_and_execute encapsulates this shared sequence so the
         # unified correction loop reuses it without duplication.
+        structlog.contextvars.bind_contextvars(stage="sql_validation")
         all_extra_stats: list[dict] = []
         validation_output, sql, execution_output, current_judge_verdict = self._validate_and_execute(
             question, sql_gen_output.sql, sql_gen_output, all_extra_stats
@@ -282,6 +305,7 @@ class AnalyticsPipeline:
         rows = execution_output.rows
 
         # Stage 3b: Result shape signals (informational — never blocks)
+        structlog.contextvars.bind_contextvars(stage="result_validation")
         result_validation_output = ResultValidator.validate(execution_output)
 
         # Unified SQL correction loop (opt-in per trigger type)
@@ -339,6 +363,17 @@ class AnalyticsPipeline:
                 current_hint = f"Result validation flags: {result_validation_output.flags}"
                 stage_name = "sql_result_validation_correction"
 
+            structlog.contextvars.bind_contextvars(stage=stage_name)
+            logger.debug(
+                "SQL correction attempt triggered",
+                trigger=stage_name,
+                attempt=(
+                    execution_correction_attempts if execution_should_correct
+                    else analytics_correction_attempts if analytics_should_correct
+                    else result_validation_correction_attempts
+                ),
+                hint=current_hint,
+            )
             correction_history.append({"sql": sql, "hint": current_hint})
             history_lines = "\n".join(f"  {i + 1}. SQL: {h['sql']!r}\n     Reason: {h['hint']}" for i, h in enumerate(correction_history))
             full_hint = f"Previous failed attempts:\n{history_lines}"
@@ -353,6 +388,16 @@ class AnalyticsPipeline:
             )
             all_extra_stats.append(correction.llm_stats)
             if correction.sql is None or correction.error:
+                logger.warning(
+                    "SQL correction returned no SQL, stopping correction loop",
+                    trigger=stage_name,
+                    error=correction.error,
+                    attempt=(
+                        execution_correction_attempts if execution_should_correct
+                        else analytics_correction_attempts if analytics_should_correct
+                        else result_validation_correction_attempts
+                    ),
+                )
                 break
 
             corrected_validation, corrected_sql, corrected_execution, corrected_verdict = self._validate_and_execute(
@@ -370,7 +415,45 @@ class AnalyticsPipeline:
             current_judge_verdict = corrected_verdict
             result_validation_output = ResultValidator.validate(execution_output)
 
+        # WHY: warn only when budget ran out AND the problem still persists —
+        # a correction that succeeded within budget is not a warning
+        if (
+            _parse_bool_env("SQL_CORRECTION_ENABLED", default=False)
+            and execution_correction_attempts >= max_execution_retries
+            and (not validation_output.is_valid or execution_output.error is not None)
+        ):
+            logger.warning(
+                "SQL correction budget exhausted, execution error persists",
+                trigger="execution",
+                attempts=execution_correction_attempts,
+                max=max_execution_retries,
+            )
+        if (
+            _parse_bool_env("SQL_ANALYTICS_JUDGE_CORRECTION_ENABLED", default=False)
+            and analytics_correction_attempts >= max_analytics_retries
+            and current_judge_verdict is not None
+            and not current_judge_verdict.verdict
+        ):
+            logger.warning(
+                "SQL correction budget exhausted, analytics judge still failing",
+                trigger="analytics",
+                attempts=analytics_correction_attempts,
+                max=max_analytics_retries,
+            )
+        if (
+            _parse_bool_env("RESULT_VALIDATION_CORRECTION_ENABLED", default=False)
+            and result_validation_correction_attempts >= max_result_validation_retries
+            and bool(result_validation_output.flags)
+        ):
+            logger.warning(
+                "SQL correction budget exhausted, result validation flags persist",
+                trigger="result_validation",
+                attempts=result_validation_correction_attempts,
+                max=max_result_validation_retries,
+            )
+
         # Stage 4: Answer Generation
+        structlog.contextvars.bind_contextvars(stage="answer_generation")
         answer_output = self.llm.generate_answer(question, sql, rows)
 
         # Stage 4b: Answer grounding judge + correction loop (opt-in, non-blocking)
@@ -402,6 +485,11 @@ class AnalyticsPipeline:
                     "error": corrected_answer_output.error,
                 })
                 if corrected_answer_output.error:
+                    logger.warning(
+                        "Answer grounding correction failed, stopping correction loop",
+                        error=corrected_answer_output.error,
+                        attempt=answer_grounding_correction_attempts,
+                    )
                     break
                 # WHY: carry over accumulated intermediate_outputs before replacing —
                 # corrected_answer_output starts with an empty list
@@ -450,6 +538,18 @@ class AnalyticsPipeline:
             key: sum(s.get(key, 0) for s in _all_stats) for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
         }
         total_llm_stats["model"] = sql_gen_output.llm_stats.get("model", "unknown")
+
+        logger.info(
+            "Pipeline run completed",
+            status=status,
+            sql_generation_ms=timings["sql_generation_ms"],
+            sql_validation_ms=timings["sql_validation_ms"],
+            sql_execution_ms=timings["sql_execution_ms"],
+            answer_generation_ms=timings["answer_generation_ms"],
+            total_ms=timings["total_ms"],
+            llm_calls=total_llm_stats["llm_calls"],
+            total_tokens=total_llm_stats["total_tokens"],
+        )
 
         return PipelineOutput(
             status=status,

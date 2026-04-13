@@ -2,5 +2,6 @@ openrouter
 pandas
 python-dotenv
 sqlglot
+structlog
 tenacity
 jinja2

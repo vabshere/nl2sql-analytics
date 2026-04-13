@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import logging
 import os
 import sqlite3
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger()
 
 TABLE_NAME = "gaming_mental_health"
 
@@ -43,10 +44,7 @@ def load_descriptions(
     callers degrade gracefully to a no-description DDL.
     """
     if not metadata_db_path.exists():
-        logger.warning(
-            "Metadata DB not found at %s — DDL will be generated without descriptions.",
-            metadata_db_path,
-        )
+        logger.warning("Metadata DB not found — DDL will be generated without descriptions", path=str(metadata_db_path))
         return "", {}
 
     # WHY: explicit close — sqlite3 context manager handles transactions only,
@@ -98,7 +96,7 @@ def introspect_columns(db_path: Path) -> list[tuple[str, str]]:
         conn.close()
     # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
     columns = [(row[1], row[2]) for row in rows]
-    logger.debug("Introspected %d columns from %s", len(columns), db_path)
+    logger.debug("Introspected columns", count=len(columns), db_path=str(db_path))
     return columns
 
 
@@ -138,9 +136,7 @@ def build_ddl(
             line = f"{base}  -- {desc}"
         else:
             if include_description and name not in column_descriptions:
-                logger.debug(
-                    "No description for column '%s' — emitting without comment.", name
-                )
+                logger.debug("No description for column — emitting without comment", column=name)
             line = base
 
         lines.append(line)

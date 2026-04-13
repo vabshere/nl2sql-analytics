@@ -14,10 +14,11 @@ from openrouter.components.chatformatjsonschemaconfig import (
 )
 
 import json
-import logging
 import os
 import time
 from typing import Any
+
+import structlog
 
 from jinja2 import Environment
 
@@ -159,7 +160,7 @@ ANSWER:
 """)
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class LLMTokenLimitError(RuntimeError):
@@ -403,12 +404,19 @@ class OpenRouterLLMClient:
             )
             sql = self._extract_sql(text)
         except Exception as exc:
+            logger.exception("SQL generation failed with an unexpected exception")
             error = str(exc)
 
         timing_ms = (time.perf_counter() - start) * 1000
         llm_stats = self.pop_stats()
         llm_stats["model"] = self.model
 
+        logger.debug(
+            "SQL generation completed",
+            timing_ms=timing_ms,
+            has_sql=sql is not None,
+            has_error=error is not None,
+        )
         return SQLGenerationOutput(
             sql=sql,
             timing_ms=timing_ms,
@@ -474,6 +482,7 @@ class OpenRouterLLMClient:
                 max_tokens=220,
             )
         except Exception as exc:
+            logger.exception("Answer generation failed with an unexpected exception")
             error = str(exc)
             answer = f"Error generating answer: {error}"
 
@@ -481,6 +490,11 @@ class OpenRouterLLMClient:
         llm_stats = self.pop_stats()
         llm_stats["model"] = self.model
 
+        logger.debug(
+            "Answer generation completed",
+            timing_ms=timing_ms,
+            has_error=error is not None,
+        )
         return AnswerGenerationOutput(
             answer=answer,
             timing_ms=timing_ms,
@@ -527,7 +541,7 @@ class OpenRouterLLMClient:
                 llm_stats=llm_stats,
             )
         except Exception as exc:
-            logger.warning("sql_analytics_judge failed: %s", exc)
+            logger.exception("SQL analytics judge failed")
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
             return SQLAnalyticsJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
@@ -572,7 +586,7 @@ class OpenRouterLLMClient:
                 llm_stats=llm_stats,
             )
         except Exception as exc:
-            logger.warning("answer_grounding_judge failed: %s", exc)
+            logger.exception("Answer grounding judge failed")
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
             return AnswerGroundingJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
