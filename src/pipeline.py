@@ -60,14 +60,17 @@ class SQLValidator:
         sql: str | None,
         schema_context: dict | None = None,
     ) -> SQLValidationOutput:
+        logger.debug("SQL validation started", sql_preview=(sql or "")[:120])
         start = time.perf_counter()
 
         def _invalid(error: str) -> SQLValidationOutput:
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug("SQL validation completed", is_valid=False, error=error, timing_ms=timing_ms)
             return SQLValidationOutput(
                 is_valid=False,
                 validated_sql=None,
                 error=error,
-                timing_ms=(time.perf_counter() - start) * 1000,
+                timing_ms=timing_ms,
             )
 
         # Layer 0: None / empty guard
@@ -118,25 +121,46 @@ class SQLValidator:
                 if not simplified.find(exp.Where):
                     return _invalid("WHERE clause is always true.")
 
+        timing_ms = (time.perf_counter() - start) * 1000
+        logger.debug("SQL validation completed", is_valid=True, timing_ms=timing_ms)
         return SQLValidationOutput(
             is_valid=True,
             validated_sql=sql,
             error=None,
-            timing_ms=(time.perf_counter() - start) * 1000,
+            timing_ms=timing_ms,
         )
 
 
 class SQLiteExecutor:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, row_limit: int = 100) -> None:
         self.db_path = Path(db_path)
+        # WHY: open once with mode=ro — enforces read-only at the OS level and
+        # fails immediately if the file doesn't exist, rather than silently
+        # creating an empty DB (sqlite3 default behaviour)
+        self._conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._row_limit = row_limit
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "SQLiteExecutor":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def run(self, sql: str | None) -> SQLExecutionOutput:
+        logger.debug("SQL execution started", sql_preview=(sql or "")[:120])
         start = time.perf_counter()
         error = None
         rows = []
         row_count = 0
 
         if sql is None:
+            logger.debug("SQL execution skipped: no SQL provided")
             return SQLExecutionOutput(
                 rows=[],
                 row_count=0,
@@ -146,27 +170,33 @@ class SQLiteExecutor:
 
         rows_truncated = False
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cur = conn.cursor()
-                cur.execute(sql)
-                rows = [dict(r) for r in cur.fetchmany(100)]
-                row_count = len(rows)
-                # WHY: probe for a 101st row only when the batch is full — if fewer
-                # than 100 rows came back we already know there was no truncation and
-                # the extra fetchone() round-trip is unnecessary
-                if row_count == 100:
-                    rows_truncated = cur.fetchone() is not None
+            cur = self._conn.cursor()
+            cur.execute(sql)
+            rows = [dict(r) for r in cur.fetchmany(self._row_limit)]
+            row_count = len(rows)
+            # WHY: probe for a (row_limit + 1)th row only when the batch is full —
+            # if fewer than row_limit rows came back we know there was no truncation
+            # and the extra fetchone() round-trip is unnecessary
+            if row_count == self._row_limit:
+                rows_truncated = cur.fetchone() is not None
         except Exception as exc:
             logger.exception("SQL execution failed with an unexpected exception")
             error = str(exc)
             rows = []
             row_count = 0
 
+        timing_ms = (time.perf_counter() - start) * 1000
+        logger.debug(
+            "SQL execution completed",
+            row_count=row_count,
+            rows_truncated=rows_truncated,
+            timing_ms=timing_ms,
+            has_error=error is not None,
+        )
         return SQLExecutionOutput(
             rows=rows,
             row_count=row_count,
-            timing_ms=(time.perf_counter() - start) * 1000,
+            timing_ms=timing_ms,
             error=error,
             rows_truncated=rows_truncated,
         )
@@ -181,18 +211,22 @@ class ResultValidator:
         The empty-rows answer path is already handled in generate_answer(); this
         adds structured metadata for logging and potential future correction loops.
         """
+        logger.debug("Result validation started", row_count=execution_output.row_count, enabled=result_validation_enabled)
         start = time.perf_counter()
 
         # WHY: caller passes the flag from config so this method has no env dependency
         if not result_validation_enabled:
+            logger.debug("Result validation skipped: disabled")
             return ResultValidationOutput(flags=[], timing_ms=0.0)
 
         # WHY: if execution itself errored, rows may be empty/partial for reasons
         # unrelated to query semantics — skip checks to avoid false signals
         if execution_output.error is not None:
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Result validation skipped: execution error", timing_ms=timing_ms)
             return ResultValidationOutput(
                 flags=[],
-                timing_ms=(time.perf_counter() - start) * 1000,
+                timing_ms=timing_ms,
             )
 
         flags: list[str] = []
@@ -201,9 +235,11 @@ class ResultValidator:
         # Flag 1: empty result (SQL ran successfully but returned no rows)
         if not rows:
             flags.append("empty_result")
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Result validation completed", flags=flags, timing_ms=timing_ms)
             return ResultValidationOutput(
                 flags=flags,
-                timing_ms=(time.perf_counter() - start) * 1000,
+                timing_ms=timing_ms,
             )
 
         # Flag 2: result was truncated at 100 rows (more rows exist in the DB)
@@ -226,9 +262,11 @@ class ResultValidator:
             if numeric_values and len(numeric_values) == len(values) and all(v == 0 for v in numeric_values):
                 flags.append(f"all_zero_column:{col}")
 
+        timing_ms = (time.perf_counter() - start) * 1000
+        logger.debug("Result validation completed", flags=flags, timing_ms=timing_ms)
         return ResultValidationOutput(
             flags=flags,
-            timing_ms=(time.perf_counter() - start) * 1000,
+            timing_ms=timing_ms,
         )
 
 
@@ -245,7 +283,7 @@ class AnalyticsPipeline:
         # it is dependency injection, not configuration
         self._config = _config_from_kwargs(config, db_path, metadata_db_path)
         self.llm = llm_client or build_default_llm_client(self._config)
-        self.executor = SQLiteExecutor(self._config.db_path)
+        self.executor = SQLiteExecutor(self._config.db_path, row_limit=self._config.sql_row_limit)
         # WHY: build once at init — schema is static, no per-request DB roundtrip
         try:
             self._schema_context = load_schema_context(
@@ -266,6 +304,24 @@ class AnalyticsPipeline:
                 db_path=str(self._config.db_path),
             )
             self._schema_context = {}
+
+    def close(self) -> None:
+        self.executor.close()
+
+    def __enter__(self) -> "AnalyticsPipeline":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # WHY: best-effort safety net for callers that don't use the context
+        # manager — GC timing is not guaranteed so this is not a substitute for
+        # explicit close() or the with-statement
+        try:
+            self.executor.close()
+        except Exception:
+            pass
 
     def _validate_and_execute(
         self,

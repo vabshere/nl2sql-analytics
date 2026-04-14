@@ -44,10 +44,19 @@ class PipelineConfig(BaseSettings):
     # token budgets per stage
     sql_max_tokens: int = 10000
     answer_max_tokens: int = 220
-    judge_max_tokens: int = 20000
-    # sampling temperatures
+    sql_judge_max_tokens: int = 20000
+    answer_judge_max_tokens: int = 20000
+    # sampling temperatures — judges default to 0.0 (deterministic grading)
     sql_temperature: float = 0.0
     answer_temperature: float = 0.2
+    sql_judge_temperature: float = 0.0
+    answer_judge_temperature: float = 0.0
+    # reasoning effort per stage — omitted from API call when None
+    # valid values: xhigh | high | medium | low | minimal | none
+    sql_reasoning_effort: str | None = None
+    answer_reasoning_effort: str | None = None
+    sql_judge_reasoning_effort: str | None = None
+    answer_judge_reasoning_effort: str | None = None
     # max rows serialised into the answer-generation prompt
     answer_rows_sample: int = 30
 
@@ -81,6 +90,19 @@ class PipelineConfig(BaseSettings):
 
     # ── Validators ────────────────────────────────────────────────────────────
 
+    @field_validator(
+        "sql_reasoning_effort",
+        "answer_reasoning_effort",
+        "sql_judge_reasoning_effort",
+        "answer_judge_reasoning_effort",
+    )
+    @classmethod
+    def effort_must_be_valid(cls, v: str | None) -> str | None:
+        _VALID_EFFORTS = {"xhigh", "high", "medium", "low", "minimal", "none"}
+        if v is not None and v not in _VALID_EFFORTS:
+            raise ValueError(f"reasoning effort must be one of {sorted(_VALID_EFFORTS)}, got {v!r}")
+        return v
+
     @field_validator("openrouter_api_key")
     @classmethod
     def api_key_not_empty(cls, v: str) -> str:
@@ -88,7 +110,7 @@ class PipelineConfig(BaseSettings):
             raise ValueError("OPENROUTER_API_KEY must not be empty or whitespace")
         return v
 
-    @field_validator("sql_temperature", "answer_temperature")
+    @field_validator("sql_temperature", "answer_temperature", "sql_judge_temperature", "answer_judge_temperature")
     @classmethod
     def temperature_in_range(cls, v: float) -> float:
         if not 0.0 <= v <= 2.0:
@@ -106,7 +128,8 @@ class PipelineConfig(BaseSettings):
         "max_answer_grounding_correction_retries",
         "sql_max_tokens",
         "answer_max_tokens",
-        "judge_max_tokens",
+        "sql_judge_max_tokens",
+        "answer_judge_max_tokens",
         mode="before",
     )
     @classmethod

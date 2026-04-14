@@ -12,6 +12,7 @@ from openrouter.components.chatformatjsonschemaconfig import (
     ChatFormatJSONSchemaConfig,
     ChatJSONSchemaConfig,
 )
+from openrouter.components import Reasoning
 from openrouter import OpenRouter
 
 import json
@@ -213,10 +214,17 @@ class OpenRouterLLMClient:
         # values from config rather than scattered hardcoded literals
         self._sql_max_tokens = config.sql_max_tokens
         self._answer_max_tokens = config.answer_max_tokens
-        self._judge_max_tokens = config.judge_max_tokens
+        self._sql_judge_max_tokens = config.sql_judge_max_tokens
+        self._answer_judge_max_tokens = config.answer_judge_max_tokens
         self._sql_temperature = config.sql_temperature
         self._answer_temperature = config.answer_temperature
+        self._sql_judge_temperature = config.sql_judge_temperature
+        self._answer_judge_temperature = config.answer_judge_temperature
         self._answer_rows_sample = config.answer_rows_sample
+        self._sql_reasoning_effort = config.sql_reasoning_effort
+        self._answer_reasoning_effort = config.answer_reasoning_effort
+        self._sql_judge_reasoning_effort = config.sql_judge_reasoning_effort
+        self._answer_judge_reasoning_effort = config.answer_judge_reasoning_effort
 
     def _chat(
         self,
@@ -224,10 +232,15 @@ class OpenRouterLLMClient:
         temperature: float,
         max_tokens: int,
         response_format=None,
+        reasoning_effort: str | None = None,
     ) -> str:
         kwargs = {}
         if response_format is not None:
             kwargs["response_format"] = response_format
+        # WHY: reasoning is only injected when explicitly set — omitting it lets
+        # non-reasoning models ignore the parameter without breaking the call
+        if reasoning_effort is not None:
+            kwargs["reasoning"] = Reasoning(effort=reasoning_effort)
 
         # WHY: wrap only the SDK call (not the full method) so that stats
         # increment and response parsing happen exactly once on success, not
@@ -384,6 +397,7 @@ class OpenRouterLLMClient:
         ]
 
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
+        logger.debug("SQL generation started", question_length=len(question))
         start = time.perf_counter()
         error = None
         sql = None
@@ -393,6 +407,7 @@ class OpenRouterLLMClient:
                 messages=self._build_sql_generation_messages(question, context),
                 temperature=self._sql_temperature,
                 max_tokens=self._sql_max_tokens,
+                reasoning_effort=self._sql_reasoning_effort,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -446,6 +461,7 @@ class OpenRouterLLMClient:
     def generate_answer(
         self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = ""
     ) -> AnswerGenerationOutput:
+        logger.debug("Answer generation started", question_length=len(question), row_count=len(rows), has_sql=sql is not None)
         if not sql:
             return AnswerGenerationOutput(
                 answer="I cannot answer this with the available table and schema. Please rephrase using known survey fields.",
@@ -484,6 +500,7 @@ class OpenRouterLLMClient:
                 ),
                 temperature=self._answer_temperature,
                 max_tokens=self._answer_max_tokens,
+                reasoning_effort=self._answer_reasoning_effort,
             )
         except Exception as exc:
             logger.exception("Answer generation failed with an unexpected exception")
@@ -520,11 +537,14 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to SQLGenerationOutput.intermediate_outputs.
         """
+        logger.debug("SQL analytics judge started", sql_preview=sql[:120])
+        start = time.perf_counter()
         try:
             text = self._chat(
                 messages=self._build_sql_judge_messages(question, sql, schema_context),
-                temperature=self._sql_temperature,
-                max_tokens=self._judge_max_tokens,
+                temperature=self._sql_judge_temperature,
+                max_tokens=self._sql_judge_max_tokens,
+                reasoning_effort=self._sql_judge_reasoning_effort,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -537,6 +557,13 @@ class OpenRouterLLMClient:
             parsed = JudgeResponse.model_validate_json(text)
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug(
+                "SQL analytics judge completed",
+                verdict=parsed.verdict,
+                grade=parsed.grade,
+                timing_ms=timing_ms,
+            )
             return SQLAnalyticsJudgeOutput(
                 verdict=parsed.verdict,
                 grade=parsed.grade,
@@ -565,11 +592,14 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to AnswerGenerationOutput.intermediate_outputs.
         """
+        logger.debug("Answer grounding judge started", answer_length=len(answer), row_count=len(rows))
+        start = time.perf_counter()
         try:
             text = self._chat(
                 messages=self._build_grounding_judge_messages(question, rows, answer),
-                temperature=self._sql_temperature,
-                max_tokens=self._judge_max_tokens,
+                temperature=self._answer_judge_temperature,
+                max_tokens=self._answer_judge_max_tokens,
+                reasoning_effort=self._answer_judge_reasoning_effort,
                 response_format=ChatFormatJSONSchemaConfig(
                     type="json_schema",
                     json_schema=ChatJSONSchemaConfig(
@@ -582,6 +612,13 @@ class OpenRouterLLMClient:
             parsed = JudgeResponse.model_validate_json(text)
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug(
+                "Answer grounding judge completed",
+                verdict=parsed.verdict,
+                grade=parsed.grade,
+                timing_ms=timing_ms,
+            )
             return AnswerGroundingJudgeOutput(
                 verdict=parsed.verdict,
                 grade=parsed.grade,

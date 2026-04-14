@@ -33,9 +33,12 @@ def test_defaults():
     # LLM generation params
     assert f["sql_max_tokens"].default == 10000
     assert f["answer_max_tokens"].default == 220
-    assert f["judge_max_tokens"].default == 20000
+    assert f["sql_judge_max_tokens"].default == 20000
+    assert f["answer_judge_max_tokens"].default == 20000
     assert f["sql_temperature"].default == 0.0
     assert f["answer_temperature"].default == 0.2
+    assert f["sql_judge_temperature"].default == 0.0
+    assert f["answer_judge_temperature"].default == 0.0
     assert f["answer_rows_sample"].default == 30
     # DB / execution
     assert f["sql_row_limit"].default == 100

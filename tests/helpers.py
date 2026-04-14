@@ -40,10 +40,17 @@ def make_llm_client(
     max_retries: int = 3,
     sql_max_tokens: int = 10000,
     answer_max_tokens: int = 220,
-    judge_max_tokens: int = 20000,
+    sql_judge_max_tokens: int = 20000,
+    answer_judge_max_tokens: int = 20000,
     sql_temperature: float = 0.0,
     answer_temperature: float = 0.2,
+    sql_judge_temperature: float = 0.0,
+    answer_judge_temperature: float = 0.0,
     answer_rows_sample: int = 30,
+    sql_reasoning_effort: str | None = None,
+    answer_reasoning_effort: str | None = None,
+    sql_judge_reasoning_effort: str | None = None,
+    answer_judge_reasoning_effort: str | None = None,
 ) -> OpenRouterLLMClient:
     """Build an OpenRouterLLMClient with a stubbed SDK, bypassing __init__.
 
@@ -60,10 +67,17 @@ def make_llm_client(
     client._max_retries = max_retries
     client._sql_max_tokens = sql_max_tokens
     client._answer_max_tokens = answer_max_tokens
-    client._judge_max_tokens = judge_max_tokens
+    client._sql_judge_max_tokens = sql_judge_max_tokens
+    client._answer_judge_max_tokens = answer_judge_max_tokens
     client._sql_temperature = sql_temperature
     client._answer_temperature = answer_temperature
+    client._sql_judge_temperature = sql_judge_temperature
+    client._answer_judge_temperature = answer_judge_temperature
     client._answer_rows_sample = answer_rows_sample
+    client._sql_reasoning_effort = sql_reasoning_effort
+    client._answer_reasoning_effort = answer_reasoning_effort
+    client._sql_judge_reasoning_effort = sql_judge_reasoning_effort
+    client._answer_judge_reasoning_effort = answer_judge_reasoning_effort
     return client
 
 
