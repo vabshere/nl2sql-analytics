@@ -343,7 +343,7 @@ class OpenRouterLLMClient:
         reasoning_effort: str | None = None,
     ) -> str:
         span = trace.get_current_span()
-        # WHY: GenAI semantic conventions — standard attributes for LLM calls
+        # WHY: semantic conventions — standard attributes for LLM calls
         # that Phoenix/OTEL backends understand and can aggregate
         span.set_attribute("gen_ai.system", "openrouter")
         span.set_attribute("gen_ai.request.model", self.model)
@@ -566,6 +566,7 @@ class OpenRouterLLMClient:
         start = time.perf_counter()
         error = None
         sql = None
+        parsed = None
 
         try:
             text = self._chat(
@@ -618,11 +619,11 @@ class OpenRouterLLMClient:
             timing_ms=timing_ms,
             has_sql=sql is not None,
             has_error=error is not None,
-            sql_preview=sql[:120],
+            sql_preview=sql[:120] if sql is not None else None,
         )
         return SQLGenerationOutput(
-            sql=parsed.sql if parsed.answerable else None,
-            answerable=parsed.answerable,
+            sql=sql if (parsed is not None and parsed.answerable) else None,
+            answerable=parsed.answerable if parsed is not None else False,
             timing_ms=timing_ms,
             llm_stats=llm_stats,
             error=error,

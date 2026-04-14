@@ -8,12 +8,14 @@ for each test and resets to NoOp on teardown, keeping tests isolated.
 Test organisation:
   - Pipeline-level spans: pipeline.run, pipeline.sql_cycle, db.execute,
     pipeline.sql_validate — exercised via BaseLLMStub (no real LLM).
-  - LLM-level spans: llm.generate_sql, llm.chat (GenAI semconv) — exercised
+  - LLM-level spans: llm.generate_sql, llm.chat — exercised
     by patching _chat() directly on OpenRouterLLMClient.
   - Log bridge: trace_id/span_id injected into structlog events.
   - Server: POST /run endpoint, lifespan shutdown.
 """
+
 from __future__ import annotations
+import pytest
 
 import json
 import sys
@@ -21,7 +23,6 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pytest
 
 try:
     from opentelemetry import trace
@@ -39,6 +40,7 @@ except ImportError:
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
+
 def _reset_tracer_provider() -> None:
     """Reset the OTel global TracerProvider so it can be re-installed.
 
@@ -55,6 +57,7 @@ def _reset_tracer_provider() -> None:
     newly installed provider on the next span creation.
     """
     import opentelemetry.trace as _t
+
     _t._TRACER_PROVIDER = None  # type: ignore[attr-defined]
     _t._TRACER_PROVIDER_SET_ONCE._done = False  # type: ignore[attr-defined]
     # Reset cached real tracers on instrumented modules
@@ -62,6 +65,7 @@ def _reset_tracer_provider() -> None:
         from src import pipeline as _pipeline_mod
         from src import llm_client as _llm_mod
         from src import conversation as _conv_mod
+
         for _mod in [_pipeline_mod, _llm_mod, _conv_mod]:
             _proxy = getattr(_mod, "_tracer", None)
             if _proxy is not None and hasattr(_proxy, "_real_tracer"):
@@ -93,6 +97,7 @@ def _spans_by_name(exporter: InMemorySpanExporter) -> dict[str, list]:
 
 # ── Helper: minimal pipeline config wired to a test DB ───────────────────────
 
+
 @pytest.fixture
 def tracing_pipeline(analytics_db_with_data, schema_description_db, span_exporter):
     """AnalyticsPipeline with stub LLM and in-memory exporter active."""
@@ -100,7 +105,7 @@ def tracing_pipeline(analytics_db_with_data, schema_description_db, span_exporte
         openrouter_api_key="test-key",
         db_path=analytics_db_with_data,
         metadata_db_path=schema_description_db,
-        otlp_enabled=True,   # does not start Phoenix — provider is already set by fixture
+        otlp_enabled=True,  # does not start Phoenix — provider is already set by fixture
         otlp_include_sql=True,
     )
     stub = BaseLLMStub()
@@ -110,6 +115,7 @@ def tracing_pipeline(analytics_db_with_data, schema_description_db, span_exporte
 
 
 # ── Phase 1: foundation ───────────────────────────────────────────────────────
+
 
 class TestTracingConfig:
     def test_otlp_disabled_by_default(self, analytics_db, schema_description_db):
@@ -149,6 +155,7 @@ class TestTracingConfig:
 
 
 # ── Phase 2: pipeline spans ───────────────────────────────────────────────────
+
 
 class TestPipelineSpans:
     def test_root_span_created(self, tracing_pipeline):
@@ -294,9 +301,7 @@ class TestPipelineSpans:
         assert exporter.get_finished_spans() == ()
         _reset_tracer_provider()  # clean up
 
-    def test_error_recorded_on_root_span_when_pipeline_errors(
-        self, analytics_db_with_data, schema_description_db, span_exporter
-    ):
+    def test_error_recorded_on_root_span_when_pipeline_errors(self, analytics_db_with_data, schema_description_db, span_exporter):
         from src.types import SQLGenerationOutput
 
         class ErrorLLMStub(BaseLLMStub):
@@ -321,9 +326,7 @@ class TestPipelineSpans:
         assert root.status.status_code == StatusCode.ERROR
         assert result.status == "unanswerable"
 
-    def test_correction_loop_produces_multiple_sql_cycle_spans(
-        self, analytics_db_with_data, schema_description_db, span_exporter
-    ):
+    def test_correction_loop_produces_multiple_sql_cycle_spans(self, analytics_db_with_data, schema_description_db, span_exporter):
         """When the first SQL attempt fails validation and correction is enabled,
         a second pipeline.sql_cycle span should be created for the correction."""
         from src.types import SQLGenerationOutput
@@ -372,6 +375,7 @@ class TestPipelineSpans:
 
 # ── Phase 3: LLM spans ────────────────────────────────────────────────────────
 
+
 class TestLLMSpans:
     def test_generate_sql_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
         """generate_sql() should produce an llm.generate_sql span when the real client is used."""
@@ -394,7 +398,7 @@ class TestLLMSpans:
         assert "llm.generate_sql" in by_name
 
     def test_chat_span_created_with_genai_attributes(self, analytics_db_with_data, schema_description_db, span_exporter):
-        """_chat() should produce an llm.chat span with GenAI semantic convention attributes."""
+        """_chat() should produce an llm.chat span with semantic convention attributes."""
         from unittest.mock import MagicMock, patch
         from src.llm_client import OpenRouterLLMClient
 
@@ -483,12 +487,14 @@ class TestLLMSpans:
         )
         client = OpenRouterLLMClient(config=config)
 
-        verdict_json = json.dumps({
-            "verdict": True,
-            "grade": "pass",
-            "issues": [],
-            "reason": "looks good",
-        })
+        verdict_json = json.dumps(
+            {
+                "verdict": True,
+                "grade": "pass",
+                "issues": [],
+                "reason": "looks good",
+            }
+        )
         mock_choice = MagicMock()
         mock_choice.finish_reason = "stop"
         mock_choice.message.content = verdict_json
@@ -533,6 +539,7 @@ class TestLLMSpans:
 
 # ── Phase 4: Log bridge ────────────────────────────────────────────────────────
 
+
 class TestLogBridge:
     def test_trace_id_injected_into_structlog_event(self, span_exporter):
         """While inside an active span, structlog events should contain trace_id."""
@@ -547,6 +554,7 @@ class TestLogBridge:
             raise structlog.DropEvent()  # suppress output
 
         from src.logging_config import configure_logging
+
         # Reconfigure logging to inject our capture processor before the renderer
         # NOTE: this is a test-only reconfiguration
         structlog.configure(
@@ -558,9 +566,13 @@ class TestLogBridge:
                 structlog.processors.format_exc_info,
                 # inject_otel_context is added by configure_logging; we replicate it:
                 lambda l, m, e: (
-                    {**e, "trace_id": format(trace.get_current_span().get_span_context().trace_id, "032x"),
-                     "span_id": format(trace.get_current_span().get_span_context().span_id, "016x")}
-                    if trace.get_current_span().get_span_context().is_valid else e
+                    {
+                        **e,
+                        "trace_id": format(trace.get_current_span().get_span_context().trace_id, "032x"),
+                        "span_id": format(trace.get_current_span().get_span_context().span_id, "016x"),
+                    }
+                    if trace.get_current_span().get_span_context().is_valid
+                    else e
                 ),
                 _capture_processor,
             ],
@@ -602,7 +614,8 @@ class TestLogBridge:
                 structlog.processors.format_exc_info,
                 lambda l, m, e: (
                     {**e, "trace_id": format(trace.get_current_span().get_span_context().trace_id, "032x")}
-                    if trace.get_current_span().get_span_context().is_valid else e
+                    if trace.get_current_span().get_span_context().is_valid
+                    else e
                 ),
                 _capture_processor,
             ],
@@ -624,6 +637,7 @@ class TestLogBridge:
 
 # ── Phase 5: Server ───────────────────────────────────────────────────────────
 
+
 class TestServer:
     def test_run_endpoint_returns_200(self, analytics_db_with_data, schema_description_db, monkeypatch, span_exporter):
         """POST /run with a valid question returns HTTP 200 with status and answer fields."""
@@ -638,6 +652,7 @@ class TestServer:
         # Import server AFTER monkeypatching env so PipelineConfig picks them up
         import importlib
         import src.server as server_module
+
         importlib.reload(server_module)
 
         # Inject stub LLM so no real API key is needed
@@ -654,9 +669,7 @@ class TestServer:
         assert "status" in body
         assert "answer" in body
 
-    def test_run_endpoint_returns_error_on_unanswerable(
-        self, analytics_db_with_data, schema_description_db, monkeypatch, span_exporter
-    ):
+    def test_run_endpoint_returns_error_on_unanswerable(self, analytics_db_with_data, schema_description_db, monkeypatch, span_exporter):
         """POST /run returns 200 with status=unanswerable when generate_sql reports an error.
 
         WHY: the pipeline's status logic maps sql=None + error set → 'unanswerable'.
@@ -682,6 +695,7 @@ class TestServer:
 
         import importlib
         import src.server as server_module
+
         importlib.reload(server_module)
 
         from src.server import app
@@ -696,11 +710,13 @@ class TestServer:
 
 # ── Phase 3b: Conversation LLM spans ─────────────────────────────────────────
 
+
 class TestConversationLLMSpans:
     """Spans on the three new LLM methods: summarize_turns, classify_intent, answer_from_context."""
 
     def _make_client(self, analytics_db_with_data, schema_description_db):
         from src.llm_client import OpenRouterLLMClient
+
         config = PipelineConfig(
             openrouter_api_key="test-key",
             db_path=analytics_db_with_data,
@@ -711,10 +727,12 @@ class TestConversationLLMSpans:
     def _turn(self):
         from src.conversation import ConversationTurn
         import time as _time
+
         return ConversationTurn(question="Q", sql="SELECT 1", answer="1", status="success", timestamp=_time.time())
 
     def test_summarize_turns_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         with patch.object(client, "_chat", return_value="summary text"):
             client.summarize_turns([self._turn()])
@@ -723,6 +741,7 @@ class TestConversationLLMSpans:
     def test_classify_intent_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
         from src.conversation import Conversation
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         conv = Conversation()
         conv.add_turn(self._turn())
@@ -733,6 +752,7 @@ class TestConversationLLMSpans:
     def test_classify_intent_span_has_intent_attribute(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
         from src.conversation import Conversation
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         conv = Conversation()
         conv.add_turn(self._turn())
@@ -743,6 +763,7 @@ class TestConversationLLMSpans:
 
     def test_answer_from_context_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         with patch.object(client, "_chat", return_value="The max was 10."):
             client.answer_from_context("What was the max?", "CONTEXT")
@@ -750,6 +771,7 @@ class TestConversationLLMSpans:
 
     def test_summarize_turns_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
             result = client.summarize_turns([self._turn()])
@@ -760,6 +782,7 @@ class TestConversationLLMSpans:
     def test_classify_intent_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
         from src.conversation import Conversation
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
             result = client.classify_intent("Q", Conversation())
@@ -770,6 +793,7 @@ class TestConversationLLMSpans:
 
     def test_answer_from_context_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
         from unittest.mock import patch
+
         client = self._make_client(analytics_db_with_data, schema_description_db)
         with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
             result = client.answer_from_context("Q", "context")
@@ -780,6 +804,7 @@ class TestConversationLLMSpans:
 
 # ── Phase 3b: Conversation session span ──────────────────────────────────────
 
+
 class TestConversationSessionSpans:
     """conversation.session.run span: attributes, path routing, pipeline nesting."""
 
@@ -789,24 +814,33 @@ class TestConversationSessionSpans:
         from unittest.mock import MagicMock
         from src.conversation import ConversationSession
         from src.types import (
-            AnswerGenerationOutput, IntentClassificationOutput, PipelineOutput,
-            ResultValidationOutput, SQLExecutionOutput, SQLGenerationOutput,
-            SQLValidationOutput, SummarizationOutput,
+            AnswerGenerationOutput,
+            IntentClassificationOutput,
+            PipelineOutput,
+            ResultValidationOutput,
+            SQLExecutionOutput,
+            SQLGenerationOutput,
+            SQLValidationOutput,
+            SummarizationOutput,
         )
+
         mock_llm = MagicMock()
         mock_llm.summarize_turns.return_value = SummarizationOutput(summary="", llm_stats=dict(self._ZERO))
-        mock_llm.classify_intent.return_value = IntentClassificationOutput(
-            intent="follow_up", reason="", llm_stats=dict(self._ZERO)
-        )
+        mock_llm.classify_intent.return_value = IntentClassificationOutput(intent="follow_up", reason="", llm_stats=dict(self._ZERO))
         mock_pipeline = MagicMock()
         mock_pipeline.llm = mock_llm
         mock_pipeline.run.return_value = PipelineOutput(
-            status="success", question="Q", request_id=None,
+            status="success",
+            question="Q",
+            request_id=None,
             sql_generation=SQLGenerationOutput(sql="SELECT 1", answerable=True, timing_ms=0.0, llm_stats=dict(self._ZERO)),
             sql_validation=SQLValidationOutput(is_valid=True, validated_sql="SELECT 1"),
             sql_execution=SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0),
             answer_generation=AnswerGenerationOutput(answer="42", timing_ms=0.0, llm_stats=dict(self._ZERO)),
-            sql="SELECT 1", rows=[], answer="42", result_validation=ResultValidationOutput(),
+            sql="SELECT 1",
+            rows=[],
+            answer="42",
+            result_validation=ResultValidationOutput(),
         )
         config = PipelineConfig(
             openrouter_api_key="test-key",
@@ -828,13 +862,12 @@ class TestConversationSessionSpans:
 
     def test_session_run_span_has_intent_attribute_after_classification(self, span_exporter):
         from src.types import IntentClassificationOutput
+
         session, _, mock_llm = self._make_session()
-        mock_llm.classify_intent.return_value = IntentClassificationOutput(
-            intent="new_query", reason="", llm_stats=dict(self._ZERO)
-        )
-        session.run("Q1")         # first turn: populate history (passthrough)
+        mock_llm.classify_intent.return_value = IntentClassificationOutput(intent="new_query", reason="", llm_stats=dict(self._ZERO))
+        session.run("Q1")  # first turn: populate history (passthrough)
         span_exporter.clear()
-        session.run("Q2")         # second turn: classification fires
+        session.run("Q2")  # second turn: classification fires
         span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
         assert span.attributes.get("conv.intent") == "new_query"
 
@@ -860,10 +893,9 @@ class TestConversationSessionSpans:
 
 # ── Phase 4: pipeline.run child of session span ───────────────────────────────
 
+
 class TestPhase4TracingSpans:
-    def test_session_run_pipeline_is_child_of_session_span(
-        self, analytics_db_with_data, schema_description_db, span_exporter
-    ):
+    def test_session_run_pipeline_is_child_of_session_span(self, analytics_db_with_data, schema_description_db, span_exporter):
         """pipeline.run span must be a direct child of conversation.session.run.
 
         WHY: OTel context propagation makes pipeline.run a child automatically —
@@ -871,6 +903,7 @@ class TestPhase4TracingSpans:
         end-to-end after pipeline.run() gains the conversation_context param.
         """
         from src.conversation import ConversationSession
+
         config = PipelineConfig(
             openrouter_api_key="test-key",
             db_path=analytics_db_with_data,
