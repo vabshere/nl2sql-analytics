@@ -73,6 +73,8 @@ pytest tests/ -m "not integration" --ignore=tests/test_public.py
 pytest -m integration
 ```
 
+**Known test failure:** `tests/test_public.py::test_invalid_sql_is_rejected` expects `status="invalid_sql"` for a DELETE request, but the pipeline returns `status="unanswerable"` — the LLM correctly identifies the request as non-answerable before SQL validation runs. The test was not modified as per the instructions in `ORIGINAL_README.md`. See `CLAUDE.md` for details.
+
 ---
 
 ## Configuration
