@@ -108,6 +108,7 @@ class _StubLLM(BaseLLMStub):
     def generate_sql(self, question, context):
         return SQLGenerationOutput(
             sql="SELECT AVG(playtime_hours) FROM gaming_mental_health",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=dict(_ZERO_STATS),
         )
@@ -152,6 +153,7 @@ def test_judge_skipped_when_no_valid_sql(analytics_db, schema_description_db, mo
         def generate_sql(self, question, context):
             return SQLGenerationOutput(
                 sql=sql_value,
+                answerable=sql_value is not None,
                 timing_ms=0.0,
                 llm_stats=dict(_ZERO_STATS),
                 error=error,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
@@ -137,9 +138,7 @@ class SQLiteExecutor:
         # WHY: open once with mode=ro — enforces read-only at the OS level and
         # fails immediately if the file doesn't exist, rather than silently
         # creating an empty DB (sqlite3 default behaviour)
-        self._conn = sqlite3.connect(
-            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
-        )
+        self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._row_limit = row_limit
 
@@ -270,6 +269,39 @@ class ResultValidator:
         )
 
 
+@dataclass
+class _CycleOutput:
+    """Return value of _run_sql_cycle — one full generate→validate→judge→execute→result-validate cycle.
+
+    WHY: a named type is clearer than a 6-element tuple and makes callers
+    resilient to future field additions.
+
+    Caller contract:
+      sql is None         → generation produced no SQL; caller must stop (break the loop).
+      sql is non-None AND validation.is_valid is False
+                          → SQL was generated but is syntactically/semantically invalid;
+                            caller should continue so correction_history records the attempt.
+      sql is non-None AND validation.is_valid is True AND judge_verdict is not None AND not judge_verdict.verdict
+                          → analytics judge failed and execution was skipped;
+                            caller should continue to trigger analytics correction.
+      sql is non-None AND validation.is_valid is True AND execution has no error
+                          → happy path; rows, result_validation, and answer generation proceed.
+
+    result_validation.flags is always empty when execution was intentionally skipped
+    (analytics judge failing with correction enabled) — avoids false empty_result signals.
+    """
+
+    # initial: newly created; correction: same object passed in, mutated
+    sql_gen_output: SQLGenerationOutput
+    sql: str | None  # None only when generation failed; non-None even when invalid
+    validation: SQLValidationOutput
+    execution: SQLExecutionOutput  # empty stub when execution was skipped
+    # None when judge disabled or generation/validation failed
+    judge_verdict: SQLAnalyticsJudgeOutput | None
+    # empty flags when execution was skipped
+    result_validation: ResultValidationOutput
+
+
 class AnalyticsPipeline:
     def __init__(
         self,
@@ -323,35 +355,185 @@ class AnalyticsPipeline:
         except Exception:
             pass
 
-    def _validate_and_execute(
+    def _should_skip_execution(self, judge_verdict: SQLAnalyticsJudgeOutput | None) -> bool:
+        """Return True when the analytics judge failed and correction is enabled.
+
+        WHY: executing analytically wrong SQL wastes a DB round-trip and would push
+        incorrect rows into execution_output before the next correction replaces the SQL.
+        """
+        return judge_verdict is not None and not judge_verdict.verdict and self._config.sql_analytics_judge_correction_enabled
+
+    def _should_correct_execution(
+        self,
+        validation_output: SQLValidationOutput,
+        execution_output: SQLExecutionOutput,
+        attempts: int,
+    ) -> bool:
+        """Return True when a validation failure or DB execution error warrants SQL correction.
+
+        WHY: covers two distinct failure modes under one flag — static validation
+        rejection (SQL never ran) and runtime DB error (SQL ran but failed).
+        In both cases the fix is the same: regenerate SQL with the error as hint.
+        """
+        return (
+            self._config.sql_correction_enabled
+            and (not validation_output.is_valid or execution_output.error is not None)
+            and attempts < self._config.max_sql_correction_retries
+        )
+
+    def _should_correct_analytics(
+        self,
+        judge_verdict: SQLAnalyticsJudgeOutput | None,
+        attempts: int,
+    ) -> bool:
+        """Return True when the analytics judge failed and correction is enabled.
+
+        WHY: called only after the execution branch was evaluated — priority guarantees
+        that an execution error did not also fire, so no re-check is needed here.
+        """
+        return (
+            self._config.sql_analytics_judge_correction_enabled
+            and judge_verdict is not None
+            and not judge_verdict.verdict
+            and attempts < self._config.max_sql_analytics_correction_retries
+        )
+
+    def _should_correct_result_validation(
+        self,
+        validation_output: SQLValidationOutput,
+        result_validation_output: ResultValidationOutput,
+        attempts: int,
+    ) -> bool:
+        """Return True when result validation flags warrant SQL correction.
+
+        WHY: result signals are only meaningful after a clean execution — the
+        validation_output.is_valid guard ensures execution actually ran.
+        Called only after execution and analytics branches were evaluated (priority).
+        """
+        return (
+            self._config.result_validation_correction_enabled
+            and validation_output.is_valid
+            and bool(result_validation_output.flags)
+            and attempts < self._config.max_result_validation_correction_retries
+        )
+
+    def _run_sql_cycle(
         self,
         question: str,
-        candidate_sql: str | None,
-        sql_gen_output: SQLGenerationOutput,
         stats_sink: list[dict],
-    ) -> tuple[SQLValidationOutput, str | None, SQLExecutionOutput, SQLAnalyticsJudgeOutput | None]:
-        """Validate a SQL candidate, optionally judge it analytically, and execute it.
+        sql_gen_output: SQLGenerationOutput | None = None,
+        correction_hint: str | None = None,
+        stage_name: str = "sql_correction",
+    ) -> _CycleOutput:
+        """Own the full per-iteration SQL cycle: generate → validate → judge → execute → result-validate.
 
-        WHY: the validate→judge→execute sequence is the same for both the initial
-        SQL and each corrected SQL — extracting it removes the duplication.
+        WHY: consolidating all five sub-stages here removes duplication between the
+        initial call in _run_impl and each correction iteration, and ensures result
+        validation never runs on a skipped execution (avoiding false empty_result flags).
 
-        Appends judge llm_stats to stats_sink in-place (empty dict when disabled).
-        Returns (validation_output, validated_sql_or_None, execution_output, judge_verdict_or_None).
-        validated_sql_or_None is None when validation fails; caller breaks the
-        correction loop on None.
-        judge_verdict_or_None is None when judge is disabled or validation failed.
+        stats_sink: judge and correction llm_stats are appended in-place.
+        sql_gen_output: must be provided for correction calls (correction_hint is not None).
+        correction_hint: when None the initial path runs; when set the correction path runs.
         """
+        _empty_execution = SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0)
+        _empty_result = ResultValidationOutput(flags=[], timing_ms=0.0)
+
+        context = self._schema_context if correction_hint is None else {**self._schema_context, "correction_hint": correction_hint}
+        gen_output = self.llm.generate_sql(question, context)
+
+        # Path-specific bookkeeping only — common pipeline logic follows
+        if correction_hint is None:
+            # Initial path: gen_output becomes the canonical sql_gen_output for this run
+            sql_gen_output = gen_output
+        else:
+            # Correction path: sql_gen_output must be provided by the caller
+            assert sql_gen_output is not None, "sql_gen_output must be provided for correction calls"
+            sql_gen_output.intermediate_outputs.append(
+                {
+                    "stage": stage_name,
+                    "corrected_sql": gen_output.sql,
+                    "error": gen_output.error,
+                }
+            )
+            stats_sink.append(gen_output.llm_stats)
+
+        # WHY: error (LLM call failed) and unanswerable (answerable=False) are distinct —
+        # error is logged as a warning; unanswerable is a valid LLM response, not an error
+        if gen_output.error:
+            logger.warning("SQL generation failed", error=gen_output.error)
+            return _CycleOutput(
+                sql_gen_output=sql_gen_output,
+                sql=None,
+                validation=SQLValidationOutput(is_valid=False, validated_sql=None, error=gen_output.error, timing_ms=0.0),
+                execution=_empty_execution,
+                judge_verdict=None,
+                result_validation=_empty_result,
+            )
+
+        if gen_output.sql is None:
+            # answerable=False: LLM determined the question cannot be answered from the schema
+            return _CycleOutput(
+                sql_gen_output=sql_gen_output,
+                sql=None,
+                validation=SQLValidationOutput(is_valid=False, validated_sql=None, error="Question is unanswerable", timing_ms=0.0),
+                execution=_empty_execution,
+                judge_verdict=None,
+                result_validation=_empty_result,
+            )
+
+        candidate_sql = gen_output.sql
+
         validation_output = SQLValidator.validate(candidate_sql, schema_context=self._schema_context)
         if not validation_output.is_valid:
-            return validation_output, candidate_sql, SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0), None
+            # WHY: return candidate_sql (never None here) so correction_history records
+            # this attempt's SQL on the next iteration
+            return _CycleOutput(
+                sql_gen_output=sql_gen_output,
+                sql=candidate_sql,
+                validation=validation_output,
+                execution=_empty_execution,
+                judge_verdict=None,
+                result_validation=_empty_result,
+            )
+
         # WHY: judge is opt-in and non-blocking; stats appended to sink for aggregation
         judge_verdict: SQLAnalyticsJudgeOutput | None = None
         if self._config.sql_analytics_judge_enabled:
             judge_verdict = self.llm.judge_sql_analytics(question, candidate_sql, self._schema_context)
             sql_gen_output.intermediate_outputs.append(judge_verdict.model_dump())
             stats_sink.append(judge_verdict.llm_stats)
+
+        if self._should_skip_execution(judge_verdict):
+            return _CycleOutput(
+                sql_gen_output=sql_gen_output,
+                sql=candidate_sql,
+                validation=validation_output,
+                execution=_empty_execution,
+                judge_verdict=judge_verdict,
+                result_validation=_empty_result,
+            )
+
         execution_output = self.executor.run(candidate_sql)
-        return validation_output, candidate_sql, execution_output, judge_verdict
+        if execution_output.error is not None:
+            # WHY: result signals are only meaningful after a clean execution —
+            # rows may be empty or partial for reasons unrelated to query semantics
+            return _CycleOutput(
+                sql_gen_output=sql_gen_output,
+                sql=candidate_sql,
+                validation=validation_output,
+                execution=execution_output,
+                judge_verdict=judge_verdict,
+                result_validation=_empty_result,
+            )
+        result_validation_output = ResultValidator.validate(execution_output, self._config.result_validation_enabled)
+        return _CycleOutput(
+            sql_gen_output=sql_gen_output,
+            sql=candidate_sql,
+            validation=validation_output,
+            execution=execution_output,
+            judge_verdict=judge_verdict,
+            result_validation=result_validation_output,
+        )
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         """Public entry point. Owns context lifecycle; delegates logic to _run_impl."""
@@ -370,24 +552,19 @@ class AnalyticsPipeline:
     def _run_impl(self, question: str, request_id: str | None) -> PipelineOutput:
         start = time.perf_counter()
 
-        # Stage 1: SQL Generation
+        # Stages 1–3b: generate → validate → judge (opt-in) → execute → result-validate
+        # WHY: _run_sql_cycle owns the full cycle; _run_impl only determines
+        # the trigger and correction hint for each iteration
         structlog.contextvars.bind_contextvars(stage="sql_generation")
-        sql_gen_output = self.llm.generate_sql(question, self._schema_context)
-        sql = sql_gen_output.sql
-
-        # Stages 2 / 2b / 3: validate → judge (opt-in) → execute
-        # WHY: _validate_and_execute encapsulates this shared sequence so the
-        # unified correction loop reuses it without duplication.
-        structlog.contextvars.bind_contextvars(stage="sql_validation")
         all_extra_stats: list[dict] = []
-        validation_output, sql, execution_output, current_judge_verdict = self._validate_and_execute(
-            question, sql_gen_output.sql, sql_gen_output, all_extra_stats
-        )
+        cycle = self._run_sql_cycle(question, all_extra_stats)
+        sql_gen_output = cycle.sql_gen_output
+        sql = cycle.sql
+        validation_output = cycle.validation
+        execution_output = cycle.execution
+        current_judge_verdict = cycle.judge_verdict
+        result_validation_output = cycle.result_validation
         rows = execution_output.rows
-
-        # Stage 3b: Result shape signals (informational — never blocks)
-        structlog.contextvars.bind_contextvars(stage="result_validation")
-        result_validation_output = ResultValidator.validate(execution_output, self._config.result_validation_enabled)
 
         # Unified SQL correction loop (opt-in per trigger type)
         # WHY: single loop handles all three correction triggers — each counter tracks
@@ -397,121 +574,83 @@ class AnalyticsPipeline:
         execution_correction_attempts = 0
         analytics_correction_attempts = 0
         result_validation_correction_attempts = 0
-        max_execution_retries = self._config.max_sql_correction_retries
-        max_analytics_retries = self._config.max_sql_analytics_correction_retries
-        max_result_validation_retries = self._config.max_result_validation_correction_retries
         correction_history: list[dict] = []
 
         while sql is not None:
-            execution_should_correct = (
-                self._config.sql_correction_enabled
-                and (not validation_output.is_valid or execution_output.error is not None)
-                and execution_correction_attempts < max_execution_retries
-            )
-            analytics_should_correct = (
-                self._config.sql_analytics_judge_correction_enabled
-                and current_judge_verdict is not None
-                and not current_judge_verdict.verdict
-                and not execution_output.error
-                and analytics_correction_attempts < max_analytics_retries
-            )
-            result_should_correct = (
-                self._config.result_validation_correction_enabled
-                and validation_output.is_valid  # WHY: result signals are only meaningful after a successful execution
-                and bool(result_validation_output.flags)
-                and not execution_output.error
-                and result_validation_correction_attempts < max_result_validation_retries
-            )
-
-            if not execution_should_correct and not analytics_should_correct and not result_should_correct:
-                break
-
-            # WHY priority: execution error blocks analytics/result checks entirely;
-            # analytics correctness takes priority over result shape since fixing wrong
-            # aggregation often resolves empty results too
-            if execution_should_correct:
+            # WHY: evaluate triggers via helpers in priority order — only one fires
+            # per iteration, preventing spurious lower-priority corrections
+            if self._should_correct_execution(validation_output, execution_output, execution_correction_attempts):
                 execution_correction_attempts += 1
-                # WHY: validation failure has no execution error — use the validation message instead
+                current_attempt = execution_correction_attempts
+                # WHY: validation failure has no execution error — use validation message instead
                 current_hint = validation_output.error if not validation_output.is_valid else execution_output.error
                 stage_name = "sql_correction"
-            elif analytics_should_correct:
+            elif self._should_correct_analytics(current_judge_verdict, analytics_correction_attempts):
                 analytics_correction_attempts += 1
-                issues_hint = current_judge_verdict.reason
-                current_hint = f"Analytics judge flagged the SQL as '{current_judge_verdict.grade}'. Issues: {issues_hint}"
+                current_attempt = analytics_correction_attempts
+                current_hint = f"Analytics judge flagged the SQL as '{current_judge_verdict.grade}'. Issues: {current_judge_verdict.reason}"
                 stage_name = "sql_analytics_correction"
-            else:
+            elif self._should_correct_result_validation(validation_output, result_validation_output, result_validation_correction_attempts):
                 result_validation_correction_attempts += 1
+                current_attempt = result_validation_correction_attempts
                 current_hint = f"Result validation flags: {result_validation_output.flags}"
                 stage_name = "sql_result_validation_correction"
+            else:
+                logger.debug(
+                    "SQL correction loop: no trigger matched, stopping",
+                    execution_attempts=execution_correction_attempts,
+                    analytics_attempts=analytics_correction_attempts,
+                    result_validation_attempts=result_validation_correction_attempts,
+                )
+                break
 
             structlog.contextvars.bind_contextvars(stage=stage_name)
             logger.debug(
                 "SQL correction attempt triggered",
                 trigger=stage_name,
-                attempt=(
-                    execution_correction_attempts if execution_should_correct
-                    else analytics_correction_attempts if analytics_should_correct
-                    else result_validation_correction_attempts
-                ),
+                attempt=current_attempt,
                 hint=current_hint,
             )
             correction_history.append({"sql": sql, "hint": current_hint})
             history_lines = "\n".join(f"  {i + 1}. SQL: {h['sql']!r}\n     Reason: {h['hint']}" for i, h in enumerate(correction_history))
             full_hint = f"Previous failed attempts:\n{history_lines}"
 
-            correction = self.llm.correct_sql(question, sql, full_hint, self._schema_context)
-            sql_gen_output.intermediate_outputs.append(
-                {
-                    "stage": stage_name,
-                    "corrected_sql": correction.sql,
-                    "error": correction.error,
-                }
-            )
-            all_extra_stats.append(correction.llm_stats)
-            if correction.sql is None or correction.error:
-                logger.warning(
-                    "SQL correction returned no SQL, stopping correction loop",
-                    trigger=stage_name,
-                    error=correction.error,
-                    attempt=(
-                        execution_correction_attempts if execution_should_correct
-                        else analytics_correction_attempts if analytics_should_correct
-                        else result_validation_correction_attempts
-                    ),
-                )
-                break
-
-            corrected_validation, corrected_sql, corrected_execution, corrected_verdict = self._validate_and_execute(
-                question, correction.sql, sql_gen_output, all_extra_stats
+            cycle = self._run_sql_cycle(
+                question,
+                all_extra_stats,
+                sql_gen_output=sql_gen_output,
+                correction_hint=full_hint,
+                stage_name=stage_name,
             )
             # WHY: always update sql + validation_output so correction_history reflects
             # the latest attempted SQL and its failure reason on subsequent iterations
-            sql = corrected_sql
-            validation_output = corrected_validation
-            if not corrected_validation.is_valid:
-                # Corrected SQL also invalid — loop retries if budget allows
-                continue
-            execution_output = corrected_execution
+            if cycle.sql is None:
+                break  # generation failed or unanswerable — _run_sql_cycle already logged
+            sql = cycle.sql
+            validation_output = cycle.validation
+            if not cycle.validation.is_valid:
+                continue  # corrected SQL also invalid — loop retries if budget allows
+            execution_output = cycle.execution
             rows = execution_output.rows
-            current_judge_verdict = corrected_verdict
-            result_validation_output = ResultValidator.validate(execution_output, self._config.result_validation_enabled)
+            current_judge_verdict = cycle.judge_verdict
+            result_validation_output = cycle.result_validation
 
         # WHY: warn only when budget ran out AND the problem still persists —
         # a correction that succeeded within budget is not a warning
         if (
             self._config.sql_correction_enabled
-            and execution_correction_attempts >= max_execution_retries
+            and execution_correction_attempts >= self._config.max_sql_correction_retries
             and (not validation_output.is_valid or execution_output.error is not None)
         ):
             logger.warning(
                 "SQL correction budget exhausted, execution error persists",
                 trigger="execution",
                 attempts=execution_correction_attempts,
-                max=max_execution_retries,
+                max=self._config.max_sql_correction_retries,
             )
         if (
             self._config.sql_analytics_judge_correction_enabled
-            and analytics_correction_attempts >= max_analytics_retries
+            and analytics_correction_attempts >= self._config.max_sql_analytics_correction_retries
             and current_judge_verdict is not None
             and not current_judge_verdict.verdict
         ):
@@ -519,23 +658,26 @@ class AnalyticsPipeline:
                 "SQL correction budget exhausted, analytics judge still failing",
                 trigger="analytics",
                 attempts=analytics_correction_attempts,
-                max=max_analytics_retries,
+                max=self._config.max_sql_analytics_correction_retries,
             )
         if (
             self._config.result_validation_correction_enabled
-            and result_validation_correction_attempts >= max_result_validation_retries
+            and result_validation_correction_attempts >= self._config.max_result_validation_correction_retries
             and bool(result_validation_output.flags)
         ):
             logger.warning(
                 "SQL correction budget exhausted, result validation flags persist",
                 trigger="result_validation",
                 attempts=result_validation_correction_attempts,
-                max=max_result_validation_retries,
+                max=self._config.max_result_validation_correction_retries,
             )
 
         # Stage 4: Answer Generation
         structlog.contextvars.bind_contextvars(stage="answer_generation")
         answer_output = self.llm.generate_answer(question, sql, rows)
+        # WHY: save before grounding correction may replace answer_output — the
+        # initial stats must reach _all_stats even when corrections occur
+        initial_answer_llm_stats = answer_output.llm_stats
 
         # Stage 4b: Answer grounding judge + correction loop (opt-in, non-blocking)
         # WHY: skip when sql or rows are absent — the fallback answer paths have
@@ -557,14 +699,18 @@ class AnalyticsPipeline:
             ):
                 answer_grounding_correction_attempts += 1
                 issues_text = "; ".join(grounding_verdict.issues) if grounding_verdict.issues else grounding_verdict.reason
-                correction_hint = f"Previous answer was not grounded in the data. Issues: {issues_text}\nPrevious answer: {answer_output.answer}"
+                correction_hint = (
+                    f"Previous answer was not grounded in the data. Issues: {issues_text}\nPrevious answer: {answer_output.answer}"
+                )
                 corrected_answer_output = self.llm.generate_answer(question, sql, rows, correction_hint=correction_hint)
                 all_extra_stats.append(corrected_answer_output.llm_stats)
-                answer_output.intermediate_outputs.append({
-                    "stage": "answer_grounding_correction",
-                    "corrected_answer": corrected_answer_output.answer,
-                    "error": corrected_answer_output.error,
-                })
+                answer_output.intermediate_outputs.append(
+                    {
+                        "stage": "answer_grounding_correction",
+                        "corrected_answer": corrected_answer_output.answer,
+                        "error": corrected_answer_output.error,
+                    }
+                )
                 if corrected_answer_output.error:
                     logger.warning(
                         "Answer grounding correction failed, stopping correction loop",
@@ -611,7 +757,7 @@ class AnalyticsPipeline:
         # Build total LLM stats
         _all_stats = [
             sql_gen_output.llm_stats,
-            answer_output.llm_stats,
+            initial_answer_llm_stats,
             answer_judge_llm_stats,
             *all_extra_stats,
         ]

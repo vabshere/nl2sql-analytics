@@ -226,30 +226,6 @@ class TestChatRetry:
 
 
 # ---------------------------------------------------------------------------
-# _extract_sql
-# ---------------------------------------------------------------------------
-
-
-class TestExtractSQL:
-    def test_json_with_sql_key(self):
-        text = json.dumps({"sql": "SELECT age FROM gaming_mental_health"})
-        assert OpenRouterLLMClient._extract_sql(text) == "SELECT age FROM gaming_mental_health"
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "SELECT age FROM gaming_mental_health",
-            "",
-        ],
-    )
-    def test_invalid_json_raises(self, text: str):
-        # WHY: structured output guarantees JSON; non-JSON is an unexpected
-        # API failure that must surface as an error, not be silently swallowed
-        with pytest.raises(json.JSONDecodeError):
-            OpenRouterLLMClient._extract_sql(text)
-
-
-# ---------------------------------------------------------------------------
 # Token limit (finish_reason == "length") handling
 # ---------------------------------------------------------------------------
 

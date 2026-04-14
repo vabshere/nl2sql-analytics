@@ -12,26 +12,19 @@ class SQLResponse(BaseModel):
     """LLM response schema for SQL generation."""
 
     sql: str | None
+    answerable: bool = Field(description="Whether answer can be queried.")
 
 
 class JudgeResponse(BaseModel):
     """Common LLM response schema enforced via structured output for all judges."""
 
-    verdict: bool = Field(
-        description="True if acceptable; false if materially incorrect."
-    )
+    verdict: bool = Field(description="True if acceptable; false if materially incorrect.")
 
-    grade: Literal["fail", "borderline", "pass"] = Field(
-        description="Overall quality classification."
-    )
+    grade: Literal["fail", "borderline", "pass"] = Field(description="Overall quality classification.")
 
-    issues: list[str] = Field(
-        description="Specific problems found; empty list if none."
-    )
+    issues: list[str] = Field(description="Specific problems found; empty list if none.")
 
-    reason: str = Field(
-        description="Brief explanation of the decision."
-    )
+    reason: str = Field(description="Brief explanation of the decision.")
 
 
 class JudgeOutput(JudgeResponse):
@@ -77,6 +70,7 @@ class SQLGenerationOutput:
     """
 
     sql: str | None
+    answerable: bool | None
     timing_ms: float
     # Aggregated: {llm_calls, prompt_tokens, completion_tokens, total_tokens, model}
     llm_stats: dict[str, Any]

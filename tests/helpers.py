@@ -93,6 +93,7 @@ class BaseLLMStub:
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
         return SQLGenerationOutput(
             sql="SELECT age FROM gaming_mental_health",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=dict(_ZERO_STATS),
         )

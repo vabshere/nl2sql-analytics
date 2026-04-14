@@ -41,6 +41,7 @@ class _CapturingLLM:
         # WHY: reference a real table so SQL validation passes and correction is not triggered
         return SQLGenerationOutput(
             sql="SELECT age FROM gaming_mental_health",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=dict(_ZERO_LLM_STATS),
             error=None,

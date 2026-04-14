@@ -136,19 +136,22 @@ class _ExecutorFailThenSucceed:
 
 
 class _LLMWithCorrection(BaseLLMStub):
-    """Stub that returns a fixed corrected SQL from correct_sql(); records calls."""
+    """Stub that returns a fixed corrected SQL on correction calls; records hints."""
 
     def __init__(self, corrected_sql: str):
         self._corrected_sql = corrected_sql
-        self.correct_sql_calls: list = []
+        self.correction_hints: list[dict] = []
 
-    def correct_sql(self, question, failed_sql, db_error, context):
-        self.correct_sql_calls.append({"failed_sql": failed_sql, "db_error": db_error})
-        return SQLGenerationOutput(
-            sql=self._corrected_sql,
-            timing_ms=0.0,
-            llm_stats=_zero_stats(),
-        )
+    def generate_sql(self, question, context):
+        if "correction_hint" in context:
+            self.correction_hints.append({"hint": context["correction_hint"]})
+            return SQLGenerationOutput(
+                sql=self._corrected_sql,
+                answerable=True,
+                timing_ms=0.0,
+                llm_stats=_zero_stats(),
+            )
+        return super().generate_sql(question, context)
 
 
 def test_correction_recovers_on_execution_error(analytics_db_with_data, schema_description_db, monkeypatch):
@@ -197,18 +200,19 @@ class _AlwaysErrorExecutorStub:
 
 
 class _LLMInvalidThenValid(BaseLLMStub):
-    """generate_sql returns a non-SELECT statement; correct_sql returns valid SELECT."""
+    """generate_sql returns a non-SELECT statement initially; on correction returns valid SELECT."""
 
     def generate_sql(self, question, context):
+        if "correction_hint" in context:
+            return SQLGenerationOutput(
+                sql="SELECT age FROM gaming_mental_health",
+                answerable=True,
+                timing_ms=0.0,
+                llm_stats=_zero_stats(),
+            )
         return SQLGenerationOutput(
             sql="DELETE FROM gaming_mental_health",
-            timing_ms=0.0,
-            llm_stats=_zero_stats(),
-        )
-
-    def correct_sql(self, question, failed_sql, db_error, context):
-        return SQLGenerationOutput(
-            sql="SELECT age FROM gaming_mental_health",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=_zero_stats(),
         )
@@ -223,8 +227,8 @@ def test_execution_correction_hint_accumulates_history(analytics_db, schema_desc
     pipeline.executor = _AlwaysErrorExecutorStub()
     pipeline.run("What are the ages?")
 
-    assert len(llm.correct_sql_calls) >= 2
-    second_hint = llm.correct_sql_calls[1]["db_error"]
+    assert len(llm.correction_hints) >= 2
+    second_hint = llm.correction_hints[1]["hint"]
     assert "Previous failed attempts" in second_hint
     assert "  2." in second_hint  # WHY: history must list at least 2 attempts by the 2nd call
 
@@ -235,22 +239,25 @@ def test_execution_correction_hint_accumulates_history(analytics_db, schema_desc
 
 
 class _LLMAnalyticsJudgeAlwaysFail(BaseLLMStub):
-    """judge_sql_analytics always returns verdict=False; correct_sql records hints."""
+    """judge_sql_analytics always returns verdict=False; generate_sql records correction hints."""
 
     def __init__(self):
-        self.correct_sql_hints: list[str] = []
+        self.correction_hints: list[str] = []
+
+    def generate_sql(self, question, context):
+        if "correction_hint" in context:
+            self.correction_hints.append(context["correction_hint"])
+            return SQLGenerationOutput(
+                sql="SELECT age FROM gaming_mental_health",
+                answerable=True,
+                timing_ms=0.0,
+                llm_stats=_zero_stats(),
+            )
+        return super().generate_sql(question, context)
 
     def judge_sql_analytics(self, question, sql, schema_context):
         return SQLAnalyticsJudgeOutput(
             verdict=False, grade="fail", issues=["missing GROUP BY"], reason=""
-        )
-
-    def correct_sql(self, question, failed_sql, db_error, context):
-        self.correct_sql_hints.append(db_error)
-        return SQLGenerationOutput(
-            sql="SELECT age FROM gaming_mental_health",
-            timing_ms=0.0,
-            llm_stats=_zero_stats(),
         )
 
 
@@ -261,7 +268,7 @@ def test_analytics_judge_correction_triggered_on_fail(analytics_db_with_data, sc
     llm = _LLMAnalyticsJudgeAlwaysFail()
     pipeline = _make_pipeline(llm, analytics_db_with_data, schema_description_db)
     output = pipeline.run("What are the ages?")
-    assert len(llm.correct_sql_hints) > 0
+    assert len(llm.correction_hints) > 0
     assert any(d.get("stage") == "sql_analytics_correction" for d in output.sql_generation.intermediate_outputs)
 
 
@@ -287,8 +294,8 @@ def test_analytics_correction_hint_accumulates_history(analytics_db_with_data, s
     pipeline = _make_pipeline(llm, analytics_db_with_data, schema_description_db)
     pipeline.run("What are the ages?")
 
-    assert len(llm.correct_sql_hints) >= 2
-    second_hint = llm.correct_sql_hints[1]
+    assert len(llm.correction_hints) >= 2
+    second_hint = llm.correction_hints[1]
     assert "Previous failed attempts" in second_hint
     assert "  2." in second_hint  # WHY: history must list at least 2 attempts by the 2nd call
 
@@ -299,15 +306,17 @@ def test_analytics_correction_hint_accumulates_history(analytics_db_with_data, s
 
 
 class _LLMResultValidationRecorder(BaseLLMStub):
-    """correct_sql records hints and returns valid SQL; judge always passes."""
+    """generate_sql records correction hints and returns valid SQL; judge always passes."""
 
     def __init__(self):
-        self.correct_sql_hints: list[str] = []
+        self.correction_hints: list[str] = []
 
-    def correct_sql(self, question, failed_sql, db_error, context):
-        self.correct_sql_hints.append(db_error)
+    def generate_sql(self, question, context):
+        if "correction_hint" in context:
+            self.correction_hints.append(context["correction_hint"])
         return SQLGenerationOutput(
             sql="SELECT age FROM gaming_mental_health",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=_zero_stats(),
         )
@@ -320,7 +329,7 @@ def test_result_validation_correction_triggered_on_empty_result(analytics_db, sc
     llm = _LLMResultValidationRecorder()
     pipeline = _make_pipeline(llm, analytics_db, schema_description_db)
     output = pipeline.run("What are the ages?")
-    assert len(llm.correct_sql_hints) > 0
+    assert len(llm.correction_hints) > 0
     assert any(d.get("stage") == "sql_result_validation_correction" for d in output.sql_generation.intermediate_outputs)
 
 

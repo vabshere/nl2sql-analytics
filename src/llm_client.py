@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sqlparse
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from src.types import (
     AnswerGenerationOutput,
@@ -49,8 +50,8 @@ Rules:
 * Never use ILIKE (not supported in SQLite)
 * Handle NULL safely when relevant
 * Read-only SQL only
-* If the user's intent is to modify, delete, update, or insert data, output null for sql — do not rephrase as a SELECT
-* If the question cannot be answered from the available schema and columns, output null for sql\
+* If the user's intent is to modify, delete, update, or insert data: answerable=false, sql=null
+* If the question cannot be answered from the available schema and columns: answerable=false, sql=null\
 """)
 
 _SQL_GEN_USER_TMPL = _JINJA_ENV.from_string("""\
@@ -295,16 +296,6 @@ class OpenRouterLLMClient:
             raise RuntimeError("OpenRouter response content is not text.")
         return content.strip()
 
-    @staticmethod
-    def _extract_sql(text: str) -> str | None:
-        # WHY: structured output guarantees valid JSON; non-JSON is an unexpected
-        # API failure that should surface as an error, not be silently swallowed
-        parsed = json.loads(text)
-        sql = parsed.get("sql") if isinstance(parsed, dict) else None
-        if isinstance(sql, str) and sql.strip():
-            return sql.strip()
-        return None
-
     # ── Prompt builders ───────────────────────────────────────────────────────
     # WHY: static methods keep prompt construction pure and testable without
     # needing an LLM client instance or mocking any HTTP calls
@@ -417,7 +408,26 @@ class OpenRouterLLMClient:
                     ),
                 ),
             )
-            sql = self._extract_sql(text)
+            parsed = SQLResponse.model_validate_json(text)
+
+            sql = parsed.sql
+            if sql:
+                try:
+                    formatted_sql = sqlparse.format(
+                        sql,
+                        reindent=True,
+                        keyword_case="upper",
+                        indent_width=4,
+                        wrap_after=80,
+                        comma_first=False,
+                        strip_comments=False,
+                    )
+
+                    sql = formatted_sql
+                except Exception:
+                    # Fallback if the parser fails on complex/invalid syntax
+                    sql = sql.strip()
+
         except Exception as exc:
             logger.exception("SQL generation failed with an unexpected exception")
             error = str(exc)
@@ -433,30 +443,12 @@ class OpenRouterLLMClient:
             has_error=error is not None,
         )
         return SQLGenerationOutput(
-            sql=sql,
+            sql=parsed.sql if parsed.answerable else None,
+            answerable=parsed.answerable,
             timing_ms=timing_ms,
             llm_stats=llm_stats,
             error=error,
         )
-
-    def correct_sql(
-        self,
-        question: str,
-        failed_sql: str,
-        db_error: str,
-        context: dict,
-    ) -> SQLGenerationOutput:
-        """Re-generate SQL with the DB error as correction context.
-
-        WHY: delegates to generate_sql() to avoid duplicating LLM call machinery.
-        The correction_hint injected into context tells the LLM exactly what went
-        wrong so it can fix the specific problem rather than regenerating blind.
-        """
-        augmented = {
-            **context,
-            "correction_hint": (f"The previous SQL failed. Fix it.\nFailed SQL: {failed_sql}\nDB error: {db_error}"),
-        }
-        return self.generate_sql(question, augmented)
 
     def generate_answer(
         self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = ""

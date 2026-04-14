@@ -99,6 +99,7 @@ class _StubLLM(BaseLLMStub):
     def generate_sql(self, question, context):
         return SQLGenerationOutput(
             sql="SELECT gender, AVG(playtime_hours) AS avg FROM gaming_mental_health GROUP BY gender",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=dict(_ZERO_STATS),
         )
@@ -145,11 +146,13 @@ def test_judge_skipped_when_no_data(analytics_db, schema_description_db, monkeyp
                 # WHY: filter guaranteed to return no rows on the empty test DB
                 return SQLGenerationOutput(
                     sql="SELECT age FROM gaming_mental_health WHERE age < 0",
+                    answerable=True,
                     timing_ms=0.0,
                     llm_stats=dict(_ZERO_STATS),
                 )
             return SQLGenerationOutput(
                 sql=sql_value,
+                answerable=sql_value is not None,
                 timing_ms=0.0,
                 llm_stats=dict(_ZERO_STATS),
                 error=error,
@@ -176,6 +179,7 @@ class _LLMGroundingAlwaysFail(BaseLLMStub):
     def generate_sql(self, question, context):
         return SQLGenerationOutput(
             sql="SELECT gender, AVG(playtime_hours) AS avg FROM gaming_mental_health GROUP BY gender",
+            answerable=True,
             timing_ms=0.0,
             llm_stats=dict(_ZERO_STATS),
         )
