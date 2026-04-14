@@ -5,6 +5,7 @@ import os
 import sys
 
 import structlog
+from opentelemetry import trace
 
 
 def configure_logging(
@@ -33,6 +34,21 @@ def configure_logging(
         level=getattr(logging, resolved_level, logging.INFO),
     )
 
+    def _inject_otel_context(logger_arg, method: str, event_dict: dict) -> dict:
+        """Bridge: inject trace_id + span_id from the active OTel span into structlog events.
+
+        WHY: correlates structured logs with traces in Phoenix — a single
+        trace_id links every log line to the span tree for that request.
+        When no span is active (or OTel is disabled) the keys are omitted
+        rather than injecting invalid zeros.
+        """
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx.is_valid:
+            event_dict["trace_id"] = format(ctx.trace_id, "032x")
+            event_dict["span_id"] = format(ctx.span_id, "016x")
+        return event_dict
+
     shared_processors: list = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
@@ -48,6 +64,7 @@ def configure_logging(
         ),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        _inject_otel_context,
     ]
 
     renderer = (

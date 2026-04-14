@@ -1,6 +1,9 @@
 from __future__ import annotations
 import sqlparse
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from src.tracing import get_tracer
 from src.types import (
     AnswerGenerationOutput,
     AnswerGroundingJudgeOutput,
@@ -165,6 +168,8 @@ ANSWER:
 
 logger = structlog.get_logger()
 
+_tracer = get_tracer(__name__)
+
 
 class LLMTokenLimitError(RuntimeError):
     """Raised when the LLM truncates its response because it hit the token cap.
@@ -227,6 +232,7 @@ class OpenRouterLLMClient:
         self._sql_judge_reasoning_effort = config.sql_judge_reasoning_effort
         self._answer_judge_reasoning_effort = config.answer_judge_reasoning_effort
 
+    @_tracer.start_as_current_span("llm.chat")
     def _chat(
         self,
         messages: list[dict[str, str]],
@@ -235,6 +241,14 @@ class OpenRouterLLMClient:
         response_format=None,
         reasoning_effort: str | None = None,
     ) -> str:
+        span = trace.get_current_span()
+        # WHY: GenAI semantic conventions — standard attributes for LLM calls
+        # that Phoenix/OTEL backends understand and can aggregate
+        span.set_attribute("gen_ai.system", "openrouter")
+        span.set_attribute("gen_ai.request.model", self.model)
+        span.set_attribute("gen_ai.request.max_tokens", max_tokens)
+        span.set_attribute("gen_ai.request.temperature", float(temperature))
+
         kwargs = {}
         if response_format is not None:
             kwargs["response_format"] = response_format
@@ -264,18 +278,31 @@ class OpenRouterLLMClient:
                 **kwargs,
             )
 
-        res = _send()
+        try:
+            res = _send()
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            raise
 
         # WHY: llm_calls is always incremented regardless of whether usage is
         # present — some models/providers may return None usage on errors.
         self._stats["llm_calls"] += 1
         usage = getattr(res, "usage", None)
+        prompt_tokens = 0
+        completion_tokens = 0
         if usage is not None:
             # WHY: SDK returns float token counts (e.g. 557.0); cast to int so
             # stats are always integers rather than floats
-            self._stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
-            self._stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            self._stats["prompt_tokens"] += prompt_tokens
+            self._stats["completion_tokens"] += completion_tokens
             self._stats["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
+        # WHY: set token counts on the span after accumulating so Phoenix can
+        # display per-call usage without needing to drain self._stats
+        span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
 
         choices = getattr(res, "choices", None) or []
         if not choices:
@@ -387,7 +414,9 @@ class OpenRouterLLMClient:
             },
         ]
 
+    @_tracer.start_as_current_span("llm.generate_sql")
     def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
+        span = trace.get_current_span()
         logger.debug("SQL generation started", question_length=len(question))
         start = time.perf_counter()
         error = None
@@ -413,8 +442,9 @@ class OpenRouterLLMClient:
             sql = parsed.sql
             if sql:
                 try:
+                    sql_to_format = sql.replace("\\n", "\n")
                     formatted_sql = sqlparse.format(
-                        sql,
+                        sql_to_format,
                         reindent=True,
                         keyword_case="upper",
                         indent_width=4,
@@ -431,6 +461,8 @@ class OpenRouterLLMClient:
         except Exception as exc:
             logger.exception("SQL generation failed with an unexpected exception")
             error = str(exc)
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, error)
 
         timing_ms = (time.perf_counter() - start) * 1000
         llm_stats = self.pop_stats()
@@ -441,6 +473,7 @@ class OpenRouterLLMClient:
             timing_ms=timing_ms,
             has_sql=sql is not None,
             has_error=error is not None,
+            sql_preview=sql[:120],
         )
         return SQLGenerationOutput(
             sql=parsed.sql if parsed.answerable else None,
@@ -450,6 +483,7 @@ class OpenRouterLLMClient:
             error=error,
         )
 
+    @_tracer.start_as_current_span("llm.generate_answer")
     def generate_answer(
         self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = ""
     ) -> AnswerGenerationOutput:
@@ -498,6 +532,9 @@ class OpenRouterLLMClient:
             logger.exception("Answer generation failed with an unexpected exception")
             error = str(exc)
             answer = f"Error generating answer: {error}"
+            span = trace.get_current_span()
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, error)
 
         timing_ms = (time.perf_counter() - start) * 1000
         llm_stats = self.pop_stats()
@@ -515,6 +552,7 @@ class OpenRouterLLMClient:
             error=error,
         )
 
+    @_tracer.start_as_current_span("llm.judge_sql_analytics")
     def judge_sql_analytics(
         self,
         question: str,
@@ -529,6 +567,7 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to SQLGenerationOutput.intermediate_outputs.
         """
+        span = trace.get_current_span()
         logger.debug("SQL analytics judge started", sql_preview=sql[:120])
         start = time.perf_counter()
         try:
@@ -556,6 +595,8 @@ class OpenRouterLLMClient:
                 grade=parsed.grade,
                 timing_ms=timing_ms,
             )
+            span.set_attribute("pipeline.judge_verdict", parsed.verdict)
+            span.set_attribute("pipeline.judge_grade", parsed.grade)
             return SQLAnalyticsJudgeOutput(
                 verdict=parsed.verdict,
                 grade=parsed.grade,
@@ -565,10 +606,13 @@ class OpenRouterLLMClient:
             )
         except Exception as exc:
             logger.exception("SQL analytics judge failed")
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
             return SQLAnalyticsJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
 
+    @_tracer.start_as_current_span("llm.judge_answer_grounding")
     def judge_answer_grounding(
         self,
         question: str,
@@ -584,6 +628,7 @@ class OpenRouterLLMClient:
 
         Returns a dict ready to append to AnswerGenerationOutput.intermediate_outputs.
         """
+        span = trace.get_current_span()
         logger.debug("Answer grounding judge started", answer_length=len(answer), row_count=len(rows))
         start = time.perf_counter()
         try:
@@ -611,6 +656,8 @@ class OpenRouterLLMClient:
                 grade=parsed.grade,
                 timing_ms=timing_ms,
             )
+            span.set_attribute("pipeline.judge_verdict", parsed.verdict)
+            span.set_attribute("pipeline.judge_grade", parsed.grade)
             return AnswerGroundingJudgeOutput(
                 verdict=parsed.verdict,
                 grade=parsed.grade,
@@ -620,6 +667,8 @@ class OpenRouterLLMClient:
             )
         except Exception as exc:
             logger.exception("Answer grounding judge failed")
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
             return AnswerGroundingJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)

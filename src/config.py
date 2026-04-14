@@ -88,6 +88,15 @@ class PipelineConfig(BaseSettings):
     answer_grounding_judge_correction_enabled: bool = False
     max_answer_grounding_correction_retries: int = 3
 
+    # ── OpenTelemetry / Phoenix tracing ───────────────────────────────────────
+    # Master switch — set to true to export spans to Phoenix
+    otlp_enabled: bool = False
+    # Phoenix HTTP OTLP endpoint (not gRPC — Phoenix uses HTTP on port 6006)
+    phoenix_endpoint: str = "http://localhost:6006/v1/traces"
+    phoenix_project_name: str = "analytics-pipeline"
+    # When False, db.statement is omitted from db.execute spans
+    otlp_include_sql: bool = True
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator(

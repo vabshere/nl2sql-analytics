@@ -6,3 +6,7 @@ sqlglot
 structlog
 tenacity
 jinja2
+arize-phoenix-otel
+opentelemetry-instrumentation-fastapi
+fastapi
+uvicorn[standard]

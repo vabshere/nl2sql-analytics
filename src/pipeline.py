@@ -13,9 +13,13 @@ from sqlglot import exp
 from sqlglot.errors import ErrorLevel
 from sqlglot.optimizer.simplify import simplify
 
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
+
 from src.config import PipelineConfig
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 from src.schema_context import load_schema_context
+from src.tracing import get_tracer
 from src.types import (
     PipelineOutput,
     ResultValidationOutput,
@@ -26,6 +30,7 @@ from src.types import (
 )
 
 logger = structlog.get_logger()
+_tracer = get_tracer(__name__)
 
 
 def _config_from_kwargs(
@@ -61,12 +66,25 @@ class SQLValidator:
         sql: str | None,
         schema_context: dict | None = None,
     ) -> SQLValidationOutput:
+        with _tracer.start_as_current_span("pipeline.sql_validate") as _span:
+            return cls._validate_impl(sql, schema_context, _span)
+
+    @classmethod
+    def _validate_impl(
+        cls,
+        sql: str | None,
+        schema_context: dict | None,
+        _span: trace.Span,
+    ) -> SQLValidationOutput:
         logger.debug("SQL validation started", sql_preview=(sql or "")[:120])
         start = time.perf_counter()
 
         def _invalid(error: str) -> SQLValidationOutput:
             timing_ms = (time.perf_counter() - start) * 1000
             logger.debug("SQL validation completed", is_valid=False, error=error, timing_ms=timing_ms)
+            _span.set_attribute("sql.is_valid", False)
+            _span.set_attribute("sql.error", error)
+            _span.set_status(StatusCode.ERROR, error)
             return SQLValidationOutput(
                 is_valid=False,
                 validated_sql=None,
@@ -124,6 +142,7 @@ class SQLValidator:
 
         timing_ms = (time.perf_counter() - start) * 1000
         logger.debug("SQL validation completed", is_valid=True, timing_ms=timing_ms)
+        _span.set_attribute("sql.is_valid", True)
         return SQLValidationOutput(
             is_valid=True,
             validated_sql=sql,
@@ -133,7 +152,7 @@ class SQLValidator:
 
 
 class SQLiteExecutor:
-    def __init__(self, db_path: str | Path, row_limit: int = 100) -> None:
+    def __init__(self, db_path: str | Path, row_limit: int = 100, config: PipelineConfig | None = None) -> None:
         self.db_path = Path(db_path)
         # WHY: open once with mode=ro — enforces read-only at the OS level and
         # fails immediately if the file doesn't exist, rather than silently
@@ -141,6 +160,9 @@ class SQLiteExecutor:
         self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._row_limit = row_limit
+        # WHY: stored so run() can read tracing flags (otlp_include_sql) without
+        # callers passing config on every call; None is safe — defaults to True
+        self._config = config
 
     def close(self) -> None:
         self._conn.close()
@@ -151,12 +173,16 @@ class SQLiteExecutor:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @_tracer.start_as_current_span("db.execute")
     def run(self, sql: str | None) -> SQLExecutionOutput:
+        span = trace.get_current_span()
+        span.set_attribute("db.system", "sqlite")
         logger.debug("SQL execution started", sql_preview=(sql or "")[:120])
         start = time.perf_counter()
         error = None
         rows = []
         row_count = 0
+        rows_truncated = False
 
         if sql is None:
             logger.debug("SQL execution skipped: no SQL provided")
@@ -167,7 +193,12 @@ class SQLiteExecutor:
                 error=None,
             )
 
-        rows_truncated = False
+        # WHY: otlp_include_sql is checked at config level — the executor stores
+        # the config reference so it can respect the flag without needing callers
+        # to pass it on every call
+        if getattr(self, "_config", None) and getattr(self._config, "otlp_include_sql", True):
+            span.set_attribute("db.statement", sql)
+
         try:
             cur = self._conn.cursor()
             cur.execute(sql)
@@ -183,8 +214,12 @@ class SQLiteExecutor:
             error = str(exc)
             rows = []
             row_count = 0
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, error)
 
         timing_ms = (time.perf_counter() - start) * 1000
+        span.set_attribute("db.row_count", row_count)
+        span.set_attribute("db.rows_truncated", rows_truncated)
         logger.debug(
             "SQL execution completed",
             row_count=row_count,
@@ -315,7 +350,7 @@ class AnalyticsPipeline:
         # it is dependency injection, not configuration
         self._config = _config_from_kwargs(config, db_path, metadata_db_path)
         self.llm = llm_client or build_default_llm_client(self._config)
-        self.executor = SQLiteExecutor(self._config.db_path, row_limit=self._config.sql_row_limit)
+        self.executor = SQLiteExecutor(self._config.db_path, row_limit=self._config.sql_row_limit, config=self._config)
         # WHY: build once at init — schema is static, no per-request DB roundtrip
         try:
             self._schema_context = load_schema_context(
@@ -417,6 +452,7 @@ class AnalyticsPipeline:
             and attempts < self._config.max_result_validation_correction_retries
         )
 
+    @_tracer.start_as_current_span("pipeline.sql_cycle")
     def _run_sql_cycle(
         self,
         question: str,
@@ -424,6 +460,8 @@ class AnalyticsPipeline:
         sql_gen_output: SQLGenerationOutput | None = None,
         correction_hint: str | None = None,
         stage_name: str = "sql_correction",
+        cycle_attempt: int = 0,
+        correction_trigger: str = "",
     ) -> _CycleOutput:
         """Own the full per-iteration SQL cycle: generate → validate → judge → execute → result-validate.
 
@@ -435,6 +473,10 @@ class AnalyticsPipeline:
         sql_gen_output: must be provided for correction calls (correction_hint is not None).
         correction_hint: when None the initial path runs; when set the correction path runs.
         """
+        span = trace.get_current_span()
+        span.set_attribute("pipeline.cycle_attempt", cycle_attempt)
+        span.set_attribute("pipeline.correction_trigger", correction_trigger)
+
         _empty_execution = SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0)
         _empty_result = ResultValidationOutput(flags=[], timing_ms=0.0)
 
@@ -535,17 +577,38 @@ class AnalyticsPipeline:
             result_validation=result_validation_output,
         )
 
+    @_tracer.start_as_current_span("pipeline.run")
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         """Public entry point. Owns context lifecycle; delegates logic to _run_impl."""
+        span = trace.get_current_span()
+        pipeline_run_id = str(uuid.uuid4())
+        span.set_attribute("pipeline.run_id", pipeline_run_id)
+        span.set_attribute("pipeline.request_id", request_id or "")
+        span.set_attribute("pipeline.model", self.llm.model)
+
         # WHY: clear first so a previous run's context does not bleed into this one
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(
-            pipeline_run_id=str(uuid.uuid4()),
+            pipeline_run_id=pipeline_run_id,
             model=self.llm.model,
             **({"request_id": request_id} if request_id is not None else {}),
         )
         try:
-            return self._run_impl(question, request_id)
+            result = self._run_impl(question, request_id)
+            span.set_attribute("pipeline.status", result.status)
+            span.set_attribute("pipeline.total_ms", result.timings.get("total_ms", 0.0))
+            span.set_attribute("pipeline.llm_calls", int(result.total_llm_stats.get("llm_calls", 0)))
+            span.set_attribute("pipeline.total_tokens", int(result.total_llm_stats.get("total_tokens", 0)))
+            # WHY: any non-success outcome (unanswerable, invalid_sql, error) marks
+            # the root span ERROR so Phoenix dashboards surface pipeline failures,
+            # not just hard exceptions
+            if result.status != "success":
+                span.set_status(StatusCode.ERROR, result.status)
+            return result
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            raise
         finally:
             structlog.contextvars.clear_contextvars()
 
@@ -557,7 +620,7 @@ class AnalyticsPipeline:
         # the trigger and correction hint for each iteration
         structlog.contextvars.bind_contextvars(stage="sql_generation")
         all_extra_stats: list[dict] = []
-        cycle = self._run_sql_cycle(question, all_extra_stats)
+        cycle = self._run_sql_cycle(question, all_extra_stats, cycle_attempt=0)
         sql_gen_output = cycle.sql_gen_output
         sql = cycle.sql
         validation_output = cycle.validation
@@ -621,6 +684,8 @@ class AnalyticsPipeline:
                 sql_gen_output=sql_gen_output,
                 correction_hint=full_hint,
                 stage_name=stage_name,
+                cycle_attempt=max(execution_correction_attempts, analytics_correction_attempts, result_validation_correction_attempts),
+                correction_trigger=stage_name,
             )
             # WHY: always update sql + validation_output so correction_history reflects
             # the latest attempted SQL and its failure reason on subsequent iterations
@@ -731,8 +796,8 @@ class AnalyticsPipeline:
         # every stage's failure is represented, and the ordering preserves existing
         # precedence (sql failures > execution failures > answer failures)
         status = "success"
-        if sql_gen_output.sql is None and sql_gen_output.error:
-            # LLM could not produce SQL
+        if sql_gen_output.sql is None and (sql_gen_output.error or not sql_gen_output.answerable):
+            # LLM either errored or explicitly said the question is unanswerable
             status = "unanswerable"
         elif not validation_output.is_valid:
             status = "invalid_sql"
