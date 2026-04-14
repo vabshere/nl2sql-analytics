@@ -184,7 +184,7 @@ class _LLMGroundingAlwaysFail(BaseLLMStub):
             llm_stats=dict(_ZERO_STATS),
         )
 
-    def generate_answer(self, question, sql, rows, correction_hint: str = ""):
+    def generate_answer(self, question, sql, rows, correction_hint: str = "", conversation_context: str = ""):
         from src.types import AnswerGenerationOutput
         self.generate_answer_calls += 1
         return AnswerGenerationOutput(

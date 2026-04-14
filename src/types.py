@@ -157,3 +157,30 @@ class PipelineOutput:
 
     # Post-execution result quality signals (informational, never blocks)
     result_validation: ResultValidationOutput = field(default_factory=ResultValidationOutput)
+
+    # Intent classified by ConversationSession. None when called via pipeline.run() directly.
+    # "passthrough" = feature disabled or empty history (no classification).
+    # "new_query" | "follow_up" | "data_question" = classified intent.
+    intent: str | None = None
+
+
+# ── Conversation history output types ────────────────────────────────────────
+
+
+@dataclass
+class SummarizationOutput:
+    """Output from llm.summarize_turns() — LLM compression of old conversation turns."""
+
+    summary: str  # "" on error
+    llm_stats: dict[str, Any]
+    error: str | None = None
+
+
+@dataclass
+class IntentClassificationOutput:
+    """Output from llm.classify_intent() — intent classification for the current question."""
+
+    intent: Literal["new_query", "follow_up", "data_question"]
+    reason: str
+    llm_stats: dict[str, Any]
+    error: str | None = None

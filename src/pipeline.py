@@ -462,6 +462,7 @@ class AnalyticsPipeline:
         stage_name: str = "sql_correction",
         cycle_attempt: int = 0,
         correction_trigger: str = "",
+        conversation_context: str = "",
     ) -> _CycleOutput:
         """Own the full per-iteration SQL cycle: generate → validate → judge → execute → result-validate.
 
@@ -481,6 +482,10 @@ class AnalyticsPipeline:
         _empty_result = ResultValidationOutput(flags=[], timing_ms=0.0)
 
         context = self._schema_context if correction_hint is None else {**self._schema_context, "correction_hint": correction_hint}
+        if conversation_context:
+            # WHY: only inject when non-empty — correction cycles reuse this method
+            # and must not lose the context on the initial call's value
+            context = {**context, "conversation_context": conversation_context}
         gen_output = self.llm.generate_sql(question, context)
 
         # Path-specific bookkeeping only — common pipeline logic follows
@@ -578,7 +583,12 @@ class AnalyticsPipeline:
         )
 
     @_tracer.start_as_current_span("pipeline.run")
-    def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
+    def run(
+        self,
+        question: str,
+        request_id: str | None = None,
+        conversation_context: str = "",
+    ) -> PipelineOutput:
         """Public entry point. Owns context lifecycle; delegates logic to _run_impl."""
         span = trace.get_current_span()
         pipeline_run_id = str(uuid.uuid4())
@@ -594,7 +604,7 @@ class AnalyticsPipeline:
             **({"request_id": request_id} if request_id is not None else {}),
         )
         try:
-            result = self._run_impl(question, request_id)
+            result = self._run_impl(question, request_id, conversation_context)
             span.set_attribute("pipeline.status", result.status)
             span.set_attribute("pipeline.total_ms", result.timings.get("total_ms", 0.0))
             span.set_attribute("pipeline.llm_calls", int(result.total_llm_stats.get("llm_calls", 0)))
@@ -612,7 +622,7 @@ class AnalyticsPipeline:
         finally:
             structlog.contextvars.clear_contextvars()
 
-    def _run_impl(self, question: str, request_id: str | None) -> PipelineOutput:
+    def _run_impl(self, question: str, request_id: str | None, conversation_context: str = "") -> PipelineOutput:
         start = time.perf_counter()
 
         # Stages 1–3b: generate → validate → judge (opt-in) → execute → result-validate
@@ -620,7 +630,7 @@ class AnalyticsPipeline:
         # the trigger and correction hint for each iteration
         structlog.contextvars.bind_contextvars(stage="sql_generation")
         all_extra_stats: list[dict] = []
-        cycle = self._run_sql_cycle(question, all_extra_stats, cycle_attempt=0)
+        cycle = self._run_sql_cycle(question, all_extra_stats, cycle_attempt=0, conversation_context=conversation_context)
         sql_gen_output = cycle.sql_gen_output
         sql = cycle.sql
         validation_output = cycle.validation
@@ -739,7 +749,7 @@ class AnalyticsPipeline:
 
         # Stage 4: Answer Generation
         structlog.contextvars.bind_contextvars(stage="answer_generation")
-        answer_output = self.llm.generate_answer(question, sql, rows)
+        answer_output = self.llm.generate_answer(question, sql, rows, conversation_context=conversation_context)
         # WHY: save before grounding correction may replace answer_output — the
         # initial stats must reach _all_stats even when corrections occur
         initial_answer_llm_stats = answer_output.llm_stats

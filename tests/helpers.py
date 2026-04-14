@@ -19,8 +19,10 @@ try:
     from src.types import (
         AnswerGenerationOutput,
         AnswerGroundingJudgeOutput,
+        IntentClassificationOutput,
         SQLAnalyticsJudgeOutput,
         SQLGenerationOutput,
+        SummarizationOutput,
     )
 except ImportError as exc:
     raise RuntimeError("Could not import project modules. Run from project root.") from exc
@@ -51,6 +53,7 @@ def make_llm_client(
     answer_reasoning_effort: str | None = None,
     sql_judge_reasoning_effort: str | None = None,
     answer_judge_reasoning_effort: str | None = None,
+    intent_max_tokens: int = 200,
 ) -> OpenRouterLLMClient:
     """Build an OpenRouterLLMClient with a stubbed SDK, bypassing __init__.
 
@@ -78,6 +81,7 @@ def make_llm_client(
     client._answer_reasoning_effort = answer_reasoning_effort
     client._sql_judge_reasoning_effort = sql_judge_reasoning_effort
     client._answer_judge_reasoning_effort = answer_judge_reasoning_effort
+    client._intent_max_tokens = intent_max_tokens
     return client
 
 
@@ -98,7 +102,14 @@ class BaseLLMStub:
             llm_stats=dict(_ZERO_STATS),
         )
 
-    def generate_answer(self, question: str, sql: str | None, rows: list) -> AnswerGenerationOutput:
+    def generate_answer(
+        self,
+        question: str,
+        sql: str | None,
+        rows: list,
+        correction_hint: str = "",
+        conversation_context: str = "",
+    ) -> AnswerGenerationOutput:
         return AnswerGenerationOutput(
             answer="stub answer",
             timing_ms=0.0,
@@ -115,6 +126,17 @@ class BaseLLMStub:
         # WHY: delegates to generate_sql so stubs that don't override this still
         # return a valid SQLGenerationOutput without duplicating stub machinery
         return self.generate_sql(question, context)
+
+    def summarize_turns(self, turns: list) -> SummarizationOutput:
+        return SummarizationOutput(summary="stub summary", llm_stats=dict(_ZERO_STATS))
+
+    def classify_intent(self, question: str, conversation: Any) -> IntentClassificationOutput:
+        return IntentClassificationOutput(
+            intent="follow_up", reason="stub", llm_stats=dict(_ZERO_STATS)
+        )
+
+    def answer_from_context(self, question: str, conversation_context: str) -> AnswerGenerationOutput:
+        return AnswerGenerationOutput(answer="stub context answer", timing_ms=0.0, llm_stats=dict(_ZERO_STATS))
 
     def pop_stats(self) -> dict[str, Any]:
         return dict(_ZERO_STATS)

@@ -88,6 +88,26 @@ class PipelineConfig(BaseSettings):
     answer_grounding_judge_correction_enabled: bool = False
     max_answer_grounding_correction_retries: int = 3
 
+    # ── Conversation history ──────────────────────────────────────────────────
+    # Master switch — set to true to enable multi-turn context
+    conversation_history_enabled: bool = False
+    # Recent turns kept verbatim when compressing; older turns are LLM-summarized
+    conversation_history_window: int = 5
+    # Trigger LLM summarization when formatted context exceeds this token count
+    # WHY: token-based is more accurate than turn-count for variable-length turns
+    conversation_context_token_limit: int = 2000
+    # When True, classify intent before injecting context
+    intent_prediction_enabled: bool = True
+    # Token budget for the intent classification LLM call
+    intent_max_tokens: int = 200
+
+    # ── Input validation ─────────────────────────────────────────────────────
+    # Maximum question length in characters. Requests exceeding this are rejected
+    # at the HTTP boundary (HTTP 422) before any LLM call is made.
+    # WHY: very long questions inflate prompt tokens and can cause unexpected costs
+    # or context-window errors; 2000 chars ≈ 500 tokens, well within safe limits.
+    max_question_length: int = 2000
+
     # ── OpenTelemetry / Phoenix tracing ───────────────────────────────────────
     # Master switch — set to true to export spans to Phoenix
     otlp_enabled: bool = False
@@ -139,6 +159,10 @@ class PipelineConfig(BaseSettings):
         "answer_max_tokens",
         "sql_judge_max_tokens",
         "answer_judge_max_tokens",
+        "conversation_history_window",
+        "conversation_context_token_limit",
+        "intent_max_tokens",
+        "max_question_length",
         mode="before",
     )
     @classmethod

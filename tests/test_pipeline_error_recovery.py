@@ -54,7 +54,7 @@ def _make_pipeline(llm, db, metadata_db) -> AnalyticsPipeline:
 class _LLMAnswerError(BaseLLMStub):
     """Stub: generate_answer always returns an error."""
 
-    def generate_answer(self, question, sql, rows):
+    def generate_answer(self, question, sql, rows, correction_hint="", conversation_context=""):
         return AnswerGenerationOutput(
             answer="Error generating answer: boom",
             timing_ms=0.0,
@@ -66,7 +66,7 @@ class _LLMAnswerError(BaseLLMStub):
 class _LLMExecutorAndAnswerError(BaseLLMStub):
     """Stub: generate_answer returns an error (executor also errors — execution wins)."""
 
-    def generate_answer(self, question, sql, rows):
+    def generate_answer(self, question, sql, rows, correction_hint="", conversation_context=""):
         return AnswerGenerationOutput(
             answer="Error: answer error",
             timing_ms=0.0,

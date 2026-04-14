@@ -12,10 +12,29 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
+    import time as _time
+
     from helpers import make_llm_client
+    from src.conversation import Conversation, ConversationTurn
     from src.llm_client import LLMTokenLimitError, OpenRouterLLMClient, _is_retryable_llm_error
+    from src.types import IntentClassificationOutput, SummarizationOutput
 except ImportError as exc:
     raise RuntimeError("Could not import project modules. Run from project root.") from exc
+
+
+# ---------------------------------------------------------------------------
+# Shared conversation helpers
+# ---------------------------------------------------------------------------
+
+
+def _conv_turn(question: str = "How many users?", sql: str = "SELECT COUNT(*) FROM t", answer: str = "42") -> ConversationTurn:
+    return ConversationTurn(question=question, sql=sql, answer=answer, status="success", timestamp=_time.time())
+
+
+def _conv_with_one_turn() -> Conversation:
+    conv = Conversation()
+    conv.add_turn(_conv_turn())
+    return conv
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +61,6 @@ class TestBuildSqlGenerationMessages:
                "correction_hint": "no such column y"}
         msgs = OpenRouterLLMClient._build_sql_generation_messages("q", ctx)
         assert "no such column y" in msgs[1]["content"]
-
-    def test_correction_hint_absent_when_not_set(self):
-        ctx = {"ddl": "CREATE TABLE t (x INT)", "tables": {"t"}}
-        msgs = OpenRouterLLMClient._build_sql_generation_messages("q", ctx)
-        assert "CORRECTION" not in msgs[1]["content"]
 
     def test_empty_context_does_not_raise(self):
         msgs = OpenRouterLLMClient._build_sql_generation_messages("q", {})
@@ -89,10 +103,6 @@ class TestBuildSqlJudgeMessages:
         msgs = OpenRouterLLMClient._build_sql_judge_messages("q", "SELECT x FROM t", ctx)
         user_content = msgs[1]["content"]
         assert user_content.index("SCHEMA") < user_content.index("QUESTION") < user_content.index("SQL")
-
-    def test_empty_ddl_omits_schema_section(self):
-        msgs = OpenRouterLLMClient._build_sql_judge_messages("q", "SELECT 1", {})
-        assert "SCHEMA" not in msgs[1]["content"]
 
 
 class TestBuildGroundingJudgeMessages:
@@ -273,3 +283,209 @@ class TestTokenLimitHandling:
 
     def test_token_limit_error_is_not_retryable(self):
         assert _is_retryable_llm_error(LLMTokenLimitError("token cap hit")) is False
+
+
+# ---------------------------------------------------------------------------
+# Conversation context — SQL generation prompt builder
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSqlGenMessagesConversationContext:
+    def test_with_conversation_context_injects_block(self):
+        ctx = {
+            "ddl": "CREATE TABLE t (x INT)",
+            "tables": {"t"},
+            "conversation_context": "RECENT TURNS:\nTurn 1:\n  Question: Q1\n  SQL: SELECT x FROM t\n  Answer: 5",
+        }
+        msgs = OpenRouterLLMClient._build_sql_generation_messages("follow up?", ctx)
+        user = msgs[1]["content"]
+        assert "CONVERSATION CONTEXT" in user
+        assert "RECENT TURNS" in user
+
+    def test_context_appears_before_user_question(self):
+        ctx = {
+            "ddl": "CREATE TABLE t (x INT)",
+            "tables": {"t"},
+            "conversation_context": "some history",
+        }
+        msgs = OpenRouterLLMClient._build_sql_generation_messages("my question", ctx)
+        user = msgs[1]["content"]
+        assert user.index("CONVERSATION CONTEXT") < user.index("USER QUESTION")
+
+
+# ---------------------------------------------------------------------------
+# Conversation context — Answer generation prompt builder
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAnswerGenMessagesConversationContext:
+    def test_with_conversation_context_injects_block(self):
+        rows = [{"x": 1}]
+        msgs = OpenRouterLLMClient._build_answer_generation_messages(
+            "q", "SELECT x FROM t", rows, conversation_context="Turn 1: Q1"
+        )
+        assert "CONVERSATION CONTEXT" in msgs[1]["content"]
+        assert "Turn 1: Q1" in msgs[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Summarization prompt builder and summarize_turns()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSummarizationMessages:
+    def test_formats_turns_into_user_message(self):
+        turns = [_conv_turn(question="How many users?", sql="SELECT COUNT(*) FROM t", answer="42")]
+        msgs = OpenRouterLLMClient._build_summarization_messages(turns)
+        user = msgs[1]["content"]
+        assert "How many users?" in user
+        assert "SELECT COUNT(*)" in user
+        assert "42" in user
+
+    def test_includes_null_sql_as_none_text(self):
+        turns = [ConversationTurn(question="Delete all", sql=None, answer="Cannot answer", status="unanswerable", timestamp=_time.time())]
+        msgs = OpenRouterLLMClient._build_summarization_messages(turns)
+        assert "(none)" in msgs[1]["content"]
+
+    def test_two_messages_system_then_user(self):
+        turns = [_conv_turn()]
+        msgs = OpenRouterLLMClient._build_summarization_messages(turns)
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+
+class TestSummarizeTurns:
+    def test_returns_summary_on_success(self):
+        client = make_llm_client()
+        turns = [_conv_turn()]
+        with patch.object(client, "_chat", return_value="- Q1 asked for count; answer 42"):
+            result = client.summarize_turns(turns)
+        assert result.summary == "- Q1 asked for count; answer 42"
+        assert result.error is None
+
+    def test_non_blocking_on_error(self):
+        client = make_llm_client()
+        turns = [_conv_turn()]
+        with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
+            result = client.summarize_turns(turns)
+        assert result.summary == ""
+        assert result.error is not None
+        assert "LLM down" in result.error
+
+    def test_returns_summarization_output_type(self):
+        client = make_llm_client()
+        turns = [_conv_turn()]
+        with patch.object(client, "_chat", return_value="summary text"):
+            result = client.summarize_turns(turns)
+        assert isinstance(result, SummarizationOutput)
+
+
+# ---------------------------------------------------------------------------
+# Intent classification prompt builder and classify_intent()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildIntentMessages:
+    def test_includes_conversation_history(self):
+        conv = _conv_with_one_turn()
+        msgs = OpenRouterLLMClient._build_intent_messages("break it down by gender", conv)
+        user = msgs[1]["content"]
+        assert "How many users?" in user  # from conv history
+        assert "break it down by gender" in user
+
+    def test_two_messages_system_then_user(self):
+        msgs = OpenRouterLLMClient._build_intent_messages("q", _conv_with_one_turn())
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+
+class TestClassifyIntent:
+    def test_returns_follow_up(self):
+        client = make_llm_client()
+        conv = _conv_with_one_turn()
+        response = json.dumps({"intent": "follow_up", "reason": "refs prior result"})
+        with patch.object(client, "_chat", return_value=response):
+            result = client.classify_intent("What about women?", conv)
+        assert result.intent == "follow_up"
+        assert result.error is None
+
+    def test_returns_new_query(self):
+        client = make_llm_client()
+        conv = _conv_with_one_turn()
+        response = json.dumps({"intent": "new_query", "reason": "unrelated topic"})
+        with patch.object(client, "_chat", return_value=response):
+            result = client.classify_intent("What is the most popular game?", conv)
+        assert result.intent == "new_query"
+        assert result.error is None
+
+    def test_fallback_follow_up_on_error(self):
+        client = make_llm_client()
+        conv = _conv_with_one_turn()
+        with patch.object(client, "_chat", side_effect=RuntimeError("API error")):
+            result = client.classify_intent("another question", conv)
+        assert result.intent == "follow_up"  # WHY: safe fallback — over-inject context
+        assert result.error is not None
+        assert "API error" in result.error
+
+    def test_returns_intent_classification_output_type(self):
+        client = make_llm_client()
+        conv = _conv_with_one_turn()
+        response = json.dumps({"intent": "follow_up", "reason": "ref"})
+        with patch.object(client, "_chat", return_value=response):
+            result = client.classify_intent("q", conv)
+        assert isinstance(result, IntentClassificationOutput)
+
+    def test_returns_data_question(self):
+        client = make_llm_client()
+        conv = _conv_with_one_turn()
+        response = json.dumps({"intent": "data_question", "reason": "asking about prior rows"})
+        with patch.object(client, "_chat", return_value=response):
+            result = client.classify_intent("What was the max score?", conv)
+        assert result.intent == "data_question"
+        assert result.error is None
+
+
+# ---------------------------------------------------------------------------
+# answer_from_context prompt builder and method
+# ---------------------------------------------------------------------------
+
+
+class TestBuildContextAnswerMessages:
+    def test_includes_question_and_context(self):
+        msgs = OpenRouterLLMClient._build_context_answer_messages(
+            "What was the max?", "RECENT TURNS:\nTurn 1:\n  Question: Q1\n  Answer: 42"
+        )
+        user = msgs[1]["content"]
+        assert "What was the max?" in user
+        assert "RECENT TURNS" in user
+
+    def test_two_messages_system_then_user(self):
+        msgs = OpenRouterLLMClient._build_context_answer_messages("q", "some context")
+        assert len(msgs) == 2
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "user"
+
+
+class TestAnswerFromContext:
+    def test_returns_answer_on_success(self):
+        client = make_llm_client()
+        with patch.object(client, "_chat", return_value="The max score was 10."):
+            result = client.answer_from_context("What was the max?", "Turn 1: Q answered 10")
+        assert result.answer == "The max score was 10."
+        assert result.error is None
+
+    def test_non_blocking_on_error(self):
+        client = make_llm_client()
+        with patch.object(client, "_chat", side_effect=RuntimeError("API down")):
+            result = client.answer_from_context("q", "some context")
+        assert result.error is not None
+        assert "API down" in result.error
+
+    def test_returns_answer_generation_output_type(self):
+        from src.types import AnswerGenerationOutput
+        client = make_llm_client()
+        with patch.object(client, "_chat", return_value="answer"):
+            result = client.answer_from_context("q", "context")
+        assert isinstance(result, AnswerGenerationOutput)

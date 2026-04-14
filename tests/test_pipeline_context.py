@@ -48,7 +48,12 @@ class _CapturingLLM:
         )
 
     def generate_answer(
-        self, question: str, sql: str | None, rows: list[dict]
+        self,
+        question: str,
+        sql: str | None,
+        rows: list[dict],
+        correction_hint: str = "",
+        conversation_context: str = "",
     ) -> AnswerGenerationOutput:
         return AnswerGenerationOutput(
             answer="stub answer",
@@ -105,3 +110,61 @@ def test_pipeline_context_respects_schema_include_description_env(
         assert expected_in_ddl in ddl
     else:
         assert "--" not in ddl
+
+
+# ── Phase 4: conversation_context threading ───────────────────────────────────
+
+class _ConvCapturingLLM(BaseLLMStub):
+    """Captures conversation_context as received by generate_sql and generate_answer."""
+
+    def __init__(self) -> None:
+        self.sql_conversation_contexts: list[str] = []
+        self.answer_conversation_contexts: list[str] = []
+
+    def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
+        self.sql_conversation_contexts.append(context.get("conversation_context", ""))
+        return SQLGenerationOutput(
+            sql="SELECT age FROM gaming_mental_health",
+            answerable=True,
+            timing_ms=0.0,
+            llm_stats=dict(_ZERO_LLM_STATS),
+        )
+
+    def generate_answer(
+        self,
+        question: str,
+        sql: str | None,
+        rows: list[dict],
+        correction_hint: str = "",
+        conversation_context: str = "",
+    ) -> AnswerGenerationOutput:
+        self.answer_conversation_contexts.append(conversation_context)
+        return AnswerGenerationOutput(answer="42", timing_ms=0.0, llm_stats=dict(_ZERO_LLM_STATS))
+
+
+def test_run_conversation_context_passed_to_sql(analytics_db_with_data, schema_description_db):
+    """conversation_context kwarg must reach generate_sql via the context dict."""
+    llm = _ConvCapturingLLM()
+    config = PipelineConfig(
+        openrouter_api_key="test-key",
+        db_path=analytics_db_with_data,
+        metadata_db_path=schema_description_db,
+    )
+    with AnalyticsPipeline(config=config, llm_client=llm) as pipeline:
+        pipeline.run("How many users?", conversation_context="RECENT TURNS:\nTurn 1: ...")
+
+    assert llm.sql_conversation_contexts == ["RECENT TURNS:\nTurn 1: ..."]
+
+
+def test_run_conversation_context_passed_to_answer(analytics_db_with_data, schema_description_db):
+    """conversation_context kwarg must reach generate_answer as a keyword argument."""
+    llm = _ConvCapturingLLM()
+    config = PipelineConfig(
+        openrouter_api_key="test-key",
+        db_path=analytics_db_with_data,
+        metadata_db_path=schema_description_db,
+    )
+    with AnalyticsPipeline(config=config, llm_client=llm) as pipeline:
+        pipeline.run("How many users?", conversation_context="RECENT TURNS:\nTurn 1: ...")
+
+    assert llm.answer_conversation_contexts == ["RECENT TURNS:\nTurn 1: ..."]

@@ -61,7 +61,8 @@ def _reset_tracer_provider() -> None:
     try:
         from src import pipeline as _pipeline_mod
         from src import llm_client as _llm_mod
-        for _mod in [_pipeline_mod, _llm_mod]:
+        from src import conversation as _conv_mod
+        for _mod in [_pipeline_mod, _llm_mod, _conv_mod]:
             _proxy = getattr(_mod, "_tracer", None)
             if _proxy is not None and hasattr(_proxy, "_real_tracer"):
                 _proxy._real_tracer = None
@@ -691,3 +692,199 @@ class TestServer:
 
         assert response.status_code == 200
         assert response.json()["status"] == "unanswerable"
+
+
+# ── Phase 3b: Conversation LLM spans ─────────────────────────────────────────
+
+class TestConversationLLMSpans:
+    """Spans on the three new LLM methods: summarize_turns, classify_intent, answer_from_context."""
+
+    def _make_client(self, analytics_db_with_data, schema_description_db):
+        from src.llm_client import OpenRouterLLMClient
+        config = PipelineConfig(
+            openrouter_api_key="test-key",
+            db_path=analytics_db_with_data,
+            metadata_db_path=schema_description_db,
+        )
+        return OpenRouterLLMClient(config=config)
+
+    def _turn(self):
+        from src.conversation import ConversationTurn
+        import time as _time
+        return ConversationTurn(question="Q", sql="SELECT 1", answer="1", status="success", timestamp=_time.time())
+
+    def test_summarize_turns_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        with patch.object(client, "_chat", return_value="summary text"):
+            client.summarize_turns([self._turn()])
+        assert "llm.summarize_turns" in _spans_by_name(span_exporter)
+
+    def test_classify_intent_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        from src.conversation import Conversation
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        conv = Conversation()
+        conv.add_turn(self._turn())
+        with patch.object(client, "_chat", return_value=json.dumps({"intent": "follow_up", "reason": "ref"})):
+            client.classify_intent("Q2", conv)
+        assert "llm.classify_intent" in _spans_by_name(span_exporter)
+
+    def test_classify_intent_span_has_intent_attribute(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        from src.conversation import Conversation
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        conv = Conversation()
+        conv.add_turn(self._turn())
+        with patch.object(client, "_chat", return_value=json.dumps({"intent": "new_query", "reason": "unrelated"})):
+            client.classify_intent("Q2", conv)
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.classify_intent")
+        assert span.attributes.get("conv.intent") == "new_query"
+
+    def test_answer_from_context_span_created(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        with patch.object(client, "_chat", return_value="The max was 10."):
+            client.answer_from_context("What was the max?", "CONTEXT")
+        assert "llm.answer_from_context" in _spans_by_name(span_exporter)
+
+    def test_summarize_turns_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
+            result = client.summarize_turns([self._turn()])
+        assert result.error is not None
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.summarize_turns")
+        assert span.status.status_code == StatusCode.ERROR
+
+    def test_classify_intent_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        from src.conversation import Conversation
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
+            result = client.classify_intent("Q", Conversation())
+        assert result.error is not None
+        assert result.intent == "follow_up"  # safe fallback
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.classify_intent")
+        assert span.status.status_code == StatusCode.ERROR
+
+    def test_answer_from_context_error_recorded_on_span(self, analytics_db_with_data, schema_description_db, span_exporter):
+        from unittest.mock import patch
+        client = self._make_client(analytics_db_with_data, schema_description_db)
+        with patch.object(client, "_chat", side_effect=RuntimeError("LLM down")):
+            result = client.answer_from_context("Q", "context")
+        assert result.error is not None
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "llm.answer_from_context")
+        assert span.status.status_code == StatusCode.ERROR
+
+
+# ── Phase 3b: Conversation session span ──────────────────────────────────────
+
+class TestConversationSessionSpans:
+    """conversation.session.run span: attributes, path routing, pipeline nesting."""
+
+    _ZERO = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "model": "stub"}
+
+    def _make_session(self, *, session_id: str = "test-session", enabled: bool = True):
+        from unittest.mock import MagicMock
+        from src.conversation import ConversationSession
+        from src.types import (
+            AnswerGenerationOutput, IntentClassificationOutput, PipelineOutput,
+            ResultValidationOutput, SQLExecutionOutput, SQLGenerationOutput,
+            SQLValidationOutput, SummarizationOutput,
+        )
+        mock_llm = MagicMock()
+        mock_llm.summarize_turns.return_value = SummarizationOutput(summary="", llm_stats=dict(self._ZERO))
+        mock_llm.classify_intent.return_value = IntentClassificationOutput(
+            intent="follow_up", reason="", llm_stats=dict(self._ZERO)
+        )
+        mock_pipeline = MagicMock()
+        mock_pipeline.llm = mock_llm
+        mock_pipeline.run.return_value = PipelineOutput(
+            status="success", question="Q", request_id=None,
+            sql_generation=SQLGenerationOutput(sql="SELECT 1", answerable=True, timing_ms=0.0, llm_stats=dict(self._ZERO)),
+            sql_validation=SQLValidationOutput(is_valid=True, validated_sql="SELECT 1"),
+            sql_execution=SQLExecutionOutput(rows=[], row_count=0, timing_ms=0.0),
+            answer_generation=AnswerGenerationOutput(answer="42", timing_ms=0.0, llm_stats=dict(self._ZERO)),
+            sql="SELECT 1", rows=[], answer="42", result_validation=ResultValidationOutput(),
+        )
+        config = PipelineConfig(
+            openrouter_api_key="test-key",
+            conversation_history_enabled=enabled,
+        )
+        session = ConversationSession(pipeline=mock_pipeline, config=config, session_id=session_id)
+        return session, mock_pipeline, mock_llm
+
+    def test_session_run_span_created(self, span_exporter):
+        session, _, _ = self._make_session()
+        session.run("Q?")
+        assert "conversation.session.run" in _spans_by_name(span_exporter)
+
+    def test_session_run_span_has_session_id_attribute(self, span_exporter):
+        session, _, _ = self._make_session(session_id="my-session")
+        session.run("Q?")
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
+        assert span.attributes.get("conv.session_id") == "my-session"
+
+    def test_session_run_span_has_intent_attribute_after_classification(self, span_exporter):
+        from src.types import IntentClassificationOutput
+        session, _, mock_llm = self._make_session()
+        mock_llm.classify_intent.return_value = IntentClassificationOutput(
+            intent="new_query", reason="", llm_stats=dict(self._ZERO)
+        )
+        session.run("Q1")         # first turn: populate history (passthrough)
+        span_exporter.clear()
+        session.run("Q2")         # second turn: classification fires
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
+        assert span.attributes.get("conv.intent") == "new_query"
+
+    def test_session_run_span_has_path_attribute(self, span_exporter):
+        session, _, _ = self._make_session()
+        session.run("Q1")
+        span_exporter.clear()
+        session.run("Q2")  # follow_up → path="pipeline"
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
+        assert span.attributes.get("conv.path") == "pipeline"
+
+    def test_session_run_passthrough_path_when_disabled(self, span_exporter):
+        session, _, _ = self._make_session(enabled=False)
+        session.run("Q?")
+        span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
+        assert span.attributes.get("conv.intent") == "passthrough"
+        assert span.attributes.get("conv.path") == "passthrough"
+
+    # NOTE: test_session_run_pipeline_is_child_of_session_span lives in Phase 4
+    # (TestPhase4TracingSpans) because it requires pipeline.run() to accept the
+    # conversation_context kwarg, which is added in Phase 4.
+
+
+# ── Phase 4: pipeline.run child of session span ───────────────────────────────
+
+class TestPhase4TracingSpans:
+    def test_session_run_pipeline_is_child_of_session_span(
+        self, analytics_db_with_data, schema_description_db, span_exporter
+    ):
+        """pipeline.run span must be a direct child of conversation.session.run.
+
+        WHY: OTel context propagation makes pipeline.run a child automatically —
+        no changes in pipeline.py needed. This test verifies the nesting is correct
+        end-to-end after pipeline.run() gains the conversation_context param.
+        """
+        from src.conversation import ConversationSession
+        config = PipelineConfig(
+            openrouter_api_key="test-key",
+            db_path=analytics_db_with_data,
+            metadata_db_path=schema_description_db,
+            conversation_history_enabled=True,
+        )
+        pipeline = AnalyticsPipeline(config=config, llm_client=BaseLLMStub())
+        session = ConversationSession(pipeline=pipeline, config=config, session_id="child-test")
+        try:
+            session.run("What is the average age?")
+        finally:
+            pipeline.close()
+
+        pipeline_span = next(s for s in span_exporter.get_finished_spans() if s.name == "pipeline.run")
+        session_span = next(s for s in span_exporter.get_finished_spans() if s.name == "conversation.session.run")
+        assert pipeline_span.parent is not None
+        assert pipeline_span.parent.span_id == session_span.context.span_id

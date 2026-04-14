@@ -7,10 +7,12 @@ from src.tracing import get_tracer
 from src.types import (
     AnswerGenerationOutput,
     AnswerGroundingJudgeOutput,
+    IntentClassificationOutput,
     JudgeResponse,
     SQLAnalyticsJudgeOutput,
     SQLGenerationOutput,
     SQLResponse,
+    SummarizationOutput,
 )
 from openrouter.components.chatformatjsonschemaconfig import (
     ChatFormatJSONSchemaConfig,
@@ -18,10 +20,11 @@ from openrouter.components.chatformatjsonschemaconfig import (
 )
 from openrouter.components import Reasoning
 from openrouter import OpenRouter
+from pydantic import BaseModel, Field
 
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -66,6 +69,11 @@ SCHEMA:
 {% if table_name %}
 TABLE:
 {{ table_name }}
+
+{% endif %}
+{% if conversation_context %}
+CONVERSATION CONTEXT:
+{{ conversation_context }}
 
 {% endif %}
 USER QUESTION:
@@ -114,6 +122,11 @@ ROW COUNT:
 
 CORRECTION CONTEXT:
 {{ correction_hint }}
+{% endif %}
+{% if conversation_context %}
+
+CONVERSATION CONTEXT:
+{{ conversation_context }}
 {% endif %}""")
 
 # ── SQL Analytics Judge ───────────────────────────────────────────────────────
@@ -163,6 +176,93 @@ ROWS:
 
 ANSWER:
 {{ answer }}\
+""")
+
+
+# ── Conversation history — Summarization ─────────────────────────────────────
+
+_SUMMARIZE_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are summarizing a data analytics conversation for use as future context.
+Write a concise bullet-point summary: what was asked, what the SQL queried, what the answer was.
+Be brief — this summary will be prepended to future LLM prompts.\
+""")
+
+_SUMMARIZE_USER_TMPL = _JINJA_ENV.from_string("""\
+TURNS TO SUMMARIZE:
+{{ turns_text }}\
+""")
+
+# ── Conversation history — Intent Classification ──────────────────────────────
+
+
+class _IntentResponse(BaseModel):
+    """Structured output schema for intent classification.
+
+    WHY: enforced via response_format=json_schema — same pattern as SQLResponse
+    and JudgeResponse. Field descriptions guide the model without inline JSON
+    instructions in the system prompt.
+    """
+
+    intent: Literal["new_query", "follow_up", "data_question"] = Field(
+        description=(
+            "follow_up: refines or extends a prior query; references prior filters, subsets, or metrics. "
+            "data_question: asks about information already present in prior results — no new SQL needed. "
+            "new_query: introduces a new subject, metric, or time range unrelated to history."
+        )
+    )
+    reason: str = Field(description="Brief one-sentence explanation of the classification decision.")
+
+
+# WHY: from __future__ import annotations postpones annotation evaluation; Pydantic
+# cannot resolve Literal at class-definition time without an explicit rebuild call.
+_IntentResponse.model_rebuild()
+
+_INTENT_CLASSIF_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are an intent classifier for a data analytics assistant. Given a conversation history \
+and a new question, classify the question into exactly one of three intents:
+
+data_question  — The answer can be derived directly from result rows or values already \
+present in the conversation history. No new database query is needed. \
+Key signal: the question refers to specific values or rows already returned \
+(e.g. "from the results you just showed", "of those", "which of those", \
+"based on what you just calculated", "from the list above").
+
+follow_up      — The question extends or refines the previous query topic but requires \
+new data from the database (e.g. a related metric, a breakdown, or a more detailed view \
+of the same subject).
+
+new_query      — The question is about a completely different topic or metric with \
+no meaningful connection to the prior conversation.
+
+Decision rule: if the existing result rows in the history are sufficient to answer the \
+question WITHOUT querying the database again, choose data_question. Otherwise, if the \
+topic is related, choose follow_up. If unrelated, choose new_query.
+
+Always populate the reason field with a one-sentence explanation before committing to an intent.\
+""")
+
+_INTENT_CLASSIF_USER_TMPL = _JINJA_ENV.from_string("""\
+CONVERSATION HISTORY:
+{{ history }}
+
+NEW QUESTION:
+{{ question }}\
+""")
+
+# ── Conversation history — Context Answer ─────────────────────────────────────
+
+_CONTEXT_ANSWER_SYSTEM_TMPL = _JINJA_ENV.from_string("""\
+You are a data analyst assistant. Answer the user's question using ONLY the conversation history provided.
+The history contains prior questions, SQL queries, and answers from this session.
+Use ONLY the information in the history — never invent new facts or run new analysis.\
+""")
+
+_CONTEXT_ANSWER_USER_TMPL = _JINJA_ENV.from_string("""\
+CONVERSATION CONTEXT:
+{{ conversation_context }}
+
+QUESTION:
+{{ question }}\
 """)
 
 
@@ -231,6 +331,7 @@ class OpenRouterLLMClient:
         self._answer_reasoning_effort = config.answer_reasoning_effort
         self._sql_judge_reasoning_effort = config.sql_judge_reasoning_effort
         self._answer_judge_reasoning_effort = config.answer_judge_reasoning_effort
+        self._intent_max_tokens = config.intent_max_tokens
 
     @_tracer.start_as_current_span("llm.chat")
     def _chat(
@@ -343,6 +444,7 @@ class OpenRouterLLMClient:
                     table_name=table_name,
                     question=question,
                     correction_hint=context.get("correction_hint", ""),
+                    conversation_context=context.get("conversation_context", ""),
                 ),
             },
         ]
@@ -354,6 +456,7 @@ class OpenRouterLLMClient:
         rows: list[dict],
         correction_hint: str = "",
         rows_sample: int = 30,
+        conversation_context: str = "",
     ) -> list[dict]:
         rows_data = rows[:rows_sample]
         # WHY: columns listed separately so the model reasons about result shape
@@ -370,6 +473,48 @@ class OpenRouterLLMClient:
                     rows=json.dumps(rows_data, ensure_ascii=True),
                     count=len(rows),
                     correction_hint=correction_hint,
+                    conversation_context=conversation_context,
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _build_summarization_messages(turns: list) -> list[dict]:
+        """Format turns into a summarization prompt."""
+        lines = []
+        for i, turn in enumerate(turns, 1):
+            sql_display = turn.sql if turn.sql is not None else "(none)"
+            lines.append(f"Turn {i}:\n  Question: {turn.question}\n  SQL: {sql_display}\n  Answer: {turn.answer}")
+        turns_text = "\n\n".join(lines)
+        return [
+            {"role": "system", "content": _SUMMARIZE_SYSTEM_TMPL.render()},
+            {"role": "user", "content": _SUMMARIZE_USER_TMPL.render(turns_text=turns_text)},
+        ]
+
+    @staticmethod
+    def _build_intent_messages(question: str, conversation: Any) -> list[dict]:
+        """Format conversation history and question into an intent classification prompt."""
+        return [
+            {"role": "system", "content": _INTENT_CLASSIF_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _INTENT_CLASSIF_USER_TMPL.render(
+                    history=conversation.format_context(),
+                    question=question,
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _build_context_answer_messages(question: str, conversation_context: str) -> list[dict]:
+        """Format a data_question prompt — answer from conversation context, no SQL."""
+        return [
+            {"role": "system", "content": _CONTEXT_ANSWER_SYSTEM_TMPL.render()},
+            {
+                "role": "user",
+                "content": _CONTEXT_ANSWER_USER_TMPL.render(
+                    conversation_context=conversation_context,
+                    question=question,
                 ),
             },
         ]
@@ -485,7 +630,12 @@ class OpenRouterLLMClient:
 
     @_tracer.start_as_current_span("llm.generate_answer")
     def generate_answer(
-        self, question: str, sql: str | None, rows: list[dict[str, Any]], correction_hint: str = ""
+        self,
+        question: str,
+        sql: str | None,
+        rows: list[dict[str, Any]],
+        correction_hint: str = "",
+        conversation_context: str = "",
     ) -> AnswerGenerationOutput:
         logger.debug("Answer generation started", question_length=len(question), row_count=len(rows), has_sql=sql is not None)
         if not sql:
@@ -522,7 +672,12 @@ class OpenRouterLLMClient:
         try:
             answer = self._chat(
                 messages=self._build_answer_generation_messages(
-                    question, sql, rows, correction_hint=correction_hint, rows_sample=self._answer_rows_sample
+                    question,
+                    sql,
+                    rows,
+                    correction_hint=correction_hint,
+                    rows_sample=self._answer_rows_sample,
+                    conversation_context=conversation_context,
                 ),
                 temperature=self._answer_temperature,
                 max_tokens=self._answer_max_tokens,
@@ -672,6 +827,117 @@ class OpenRouterLLMClient:
             llm_stats = self.pop_stats()
             llm_stats["model"] = self.model
             return AnswerGroundingJudgeOutput(verdict=False, grade="fail", issues=[], reason="", error=str(exc), llm_stats=llm_stats)
+
+    @_tracer.start_as_current_span("llm.summarize_turns")
+    def summarize_turns(self, turns: list) -> SummarizationOutput:
+        """LLM summary of turns for context compression.
+
+        Non-blocking: on any exception returns SummarizationOutput(summary="", error=...).
+        WHY: empty on error retains original turns — safer than replacing them with wrong text.
+        """
+        span = trace.get_current_span()
+        start = time.perf_counter()
+        try:
+            summary = self._chat(
+                messages=self._build_summarization_messages(turns),
+                temperature=self._answer_temperature,
+                max_tokens=self._answer_max_tokens,
+            )
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            logger.debug("Conversation summarization completed", turns_count=len(turns), timing_ms=(time.perf_counter() - start) * 1000)
+            return SummarizationOutput(summary=summary, llm_stats=llm_stats)
+        except Exception as exc:
+            logger.exception("Conversation summarization failed")
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return SummarizationOutput(summary="", llm_stats=llm_stats, error=str(exc))
+
+    @_tracer.start_as_current_span("llm.classify_intent")
+    def classify_intent(self, question: str, conversation: Any) -> IntentClassificationOutput:
+        """Classify whether question is follow_up, data_question, or new_query.
+
+        Uses structured output (_IntentResponse). Non-blocking: on any exception
+        returns follow_up (safe fallback).
+        WHY: follow_up fallback is safer — over-injecting context is less harmful
+        than missing context on a genuine follow-up question.
+        """
+        span = trace.get_current_span()
+        start = time.perf_counter()
+        try:
+            text = self._chat(
+                messages=self._build_intent_messages(question, conversation),
+                temperature=0.0,
+                max_tokens=self._intent_max_tokens,
+                response_format=ChatFormatJSONSchemaConfig(
+                    type="json_schema",
+                    json_schema=ChatJSONSchemaConfig(
+                        name="intent_classification",
+                        schema_=_IntentResponse.model_json_schema(),
+                        strict=True,
+                    ),
+                ),
+            )
+            parsed = _IntentResponse.model_validate_json(text)
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            logger.debug("Intent classification completed", intent=parsed.intent, timing_ms=(time.perf_counter() - start) * 1000)
+            span.set_attribute("conv.intent", parsed.intent)
+            return IntentClassificationOutput(
+                intent=parsed.intent,
+                reason=parsed.reason,
+                llm_stats=llm_stats,
+            )
+        except Exception as exc:
+            logger.exception("Intent classification failed, falling back to follow_up")
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            return IntentClassificationOutput(
+                intent="follow_up",
+                reason="",
+                llm_stats=llm_stats,
+                error=str(exc),
+            )
+
+    @_tracer.start_as_current_span("llm.answer_from_context")
+    def answer_from_context(self, question: str, conversation_context: str) -> AnswerGenerationOutput:
+        """Answer directly from conversation context — no SQL cycle.
+
+        Non-blocking: on any exception returns AnswerGenerationOutput with error set.
+        WHY: data_question intent means the answer exists in prior results;
+        a separate method with its own prompt keeps this path independent of
+        the SQL-backed generate_answer flow.
+        """
+        span = trace.get_current_span()
+        start = time.perf_counter()
+        try:
+            answer = self._chat(
+                messages=self._build_context_answer_messages(question, conversation_context),
+                temperature=self._answer_temperature,
+                max_tokens=self._answer_max_tokens,
+            )
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            timing_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Context answer completed", timing_ms=timing_ms)
+            return AnswerGenerationOutput(answer=answer, timing_ms=timing_ms, llm_stats=llm_stats)
+        except Exception as exc:
+            logger.exception("Context answer generation failed")
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            llm_stats = self.pop_stats()
+            llm_stats["model"] = self.model
+            timing_ms = (time.perf_counter() - start) * 1000
+            return AnswerGenerationOutput(
+                answer=f"Error generating answer: {exc}",
+                timing_ms=timing_ms,
+                llm_stats=llm_stats,
+                error=str(exc),
+            )
 
     def pop_stats(self) -> dict[str, Any]:
         out = dict(self._stats or {})

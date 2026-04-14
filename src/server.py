@@ -19,13 +19,15 @@ and guarantees cleanup runs even when the server exits abnormally.
 from __future__ import annotations
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from src.config import PipelineConfig
+from src.conversation import ConversationSession
 from src.pipeline import AnalyticsPipeline
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,10 @@ async def lifespan(app: FastAPI):
 
     pipeline = AnalyticsPipeline(config=config)
     app.state.pipeline = pipeline
+    app.state.config = config
+    # WHY: dict keyed by session_id; each value is a ConversationSession that owns
+    # its own Conversation history. In-memory only — lost on server restart.
+    app.state.sessions: dict[str, ConversationSession] = {}
 
     yield
 
@@ -66,27 +72,55 @@ app = FastAPI(lifespan=lifespan)
 class RunRequest(BaseModel):
     question: str
     request_id: str | None = None
+    session_id: str | None = None
 
 
 class RunResponse(BaseModel):
     status: str
     answer: str
     sql: str | None = None
+    session_id: str
 
 
 @app.post("/run", response_model=RunResponse)
 async def run_pipeline(body: RunRequest) -> RunResponse:
     """Run the analytics pipeline for a natural-language question.
 
+    Session routing: if session_id is provided and known, the existing
+    ConversationSession is reused so multi-turn history is preserved.
+    If session_id is absent or unknown, a fresh session is created.
+
     The incoming W3C traceparent header (if present) is extracted by the
     FastAPIInstrumentor, so pipeline.run() spans are automatically children
     of the HTTP span — no manual context propagation required.
     """
-    result = app.state.pipeline.run(body.question, body.request_id)
+    if not body.question.strip():
+        raise HTTPException(status_code=422, detail="Question must not be empty.")
+
+    max_len = app.state.config.max_question_length
+    if len(body.question) > max_len:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Question exceeds maximum length of {max_len} characters.",
+        )
+
+    session_id = body.session_id or str(uuid.uuid4())
+    sessions: dict[str, ConversationSession] = app.state.sessions
+
+    if session_id not in sessions:
+        sessions[session_id] = ConversationSession(
+            pipeline=app.state.pipeline,
+            config=app.state.config,
+            session_id=session_id,
+        )
+
+    session = sessions[session_id]
+    result = session.run(body.question, body.request_id)
     return RunResponse(
         status=result.status,
         answer=result.answer,
         sql=result.sql,
+        session_id=session_id,
     )
 
 
